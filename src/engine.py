@@ -7,9 +7,8 @@ import os
 import sys
 import random
 import subprocess
-import math
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List, Callable
 
 FAKE_CAMERAS = [
@@ -196,7 +195,7 @@ def process_single_video(
     output_folder: str,
     index: int,
     params: Optional[UniqueParams] = None,
-    progress_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
     cancelled: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """
@@ -234,10 +233,11 @@ def process_single_video(
 
     # VIDEO FILTERS
     flip_filter = "hflip," if p.do_hflip else ""
-    cm = p.crop_margin
-    micro_crop = f"crop=iw-{cm*2}:ih-{cm*2}:{cm}:{cm},"
-
     tw, th = p.target_width, p.target_height
+    cm = p.crop_margin
+    cm = min(cm, (min(tw, th) // 2) - 1)
+    cm = max(cm, 0)
+    micro_crop = f"crop=iw-{cm*2}:ih-{cm*2}:{cm}:{cm},"
 
     fg_scale = (
         f"scale=iw*{p.zoom}:-1,"
@@ -339,8 +339,11 @@ def process_single_video(
     if cancelled and cancelled():
         return False
 
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return result.returncode == 0
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return result.returncode == 0
+    except OSError:
+        return False
 
 
 def process_batch(

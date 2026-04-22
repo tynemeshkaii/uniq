@@ -27,7 +27,7 @@ from styles import MAIN_STYLESHEET
 
 class ProcessWorker(QThread):
     progress = pyqtSignal(int, int, str)   # current, total, filename
-    finished = pyqtSignal(int)              # success_count
+    finished = pyqtSignal(int, bool)        # success_count, was_cancelled
     error = pyqtSignal(str)
 
     def __init__(self, files, output_folder, params, parent=None):
@@ -53,7 +53,7 @@ class ProcessWorker(QThread):
                 progress_callback=lambda cur, tot, fn: self.progress.emit(cur, tot, fn),
                 cancelled=self.is_cancelled,
             )
-            self.finished.emit(count)
+            self.finished.emit(count, self._cancelled)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -425,7 +425,8 @@ class ParamsPanel(QWidget):
         p.k1 = round(random.uniform(-self.spin_k1_max.value(), self.spin_k1_max.value()), 4)
         p.rotate = round(random.uniform(-self.spin_rotate_max.value(), self.spin_rotate_max.value()), 3)
         p.zoom = round(random.uniform(self.spin_zoom_min.value(), self.spin_zoom_max.value()), 3)
-        p.crop_margin = random.randint(self.spin_crop_min.value(), max(self.spin_crop_min.value(), self.spin_crop_max.value()))
+        lo, hi = self.spin_crop_min.value(), self.spin_crop_max.value()
+        p.crop_margin = random.randint(min(lo, hi), max(lo, hi))
 
         cs = self.spin_color_shift.value()
         p.rs = round(random.uniform(-cs, cs), 3)
@@ -437,7 +438,8 @@ class ParamsPanel(QWidget):
         p.hue_shift = round(random.uniform(-self.spin_hue_max.value(), self.spin_hue_max.value()), 1)
 
         p.unsharp_amount = round(random.uniform(self.spin_unsharp_min.value(), self.spin_unsharp_max.value()), 2)
-        p.noise_strength = random.randint(self.spin_noise_min.value(), max(self.spin_noise_min.value(), self.spin_noise_max.value()))
+        lo, hi = self.spin_noise_min.value(), self.spin_noise_max.value()
+        p.noise_strength = random.randint(min(lo, hi), max(lo, hi))
         p.noise_flags = random.choice(["t", "u", "t+u"])
         p.do_hflip = self.chk_hflip.isChecked() and random.choice([True, False])
         p.vignette_angle = round(random.uniform(self.spin_vignette_min.value(), self.spin_vignette_max.value()), 2)
@@ -448,7 +450,8 @@ class ParamsPanel(QWidget):
         p.trim_end = round(random.uniform(0.1, self.spin_trim_end_max.value()), 2)
 
         p.pitch = clamp(round(random.uniform(self.spin_pitch_min.value(), self.spin_pitch_max.value()), 4), 0.9, 1.1)
-        p.adelay_ms = random.randint(self.spin_adelay_min.value(), max(self.spin_adelay_min.value(), self.spin_adelay_max.value()))
+        lo, hi = self.spin_adelay_min.value(), self.spin_adelay_max.value()
+        p.adelay_ms = random.randint(min(lo, hi), max(lo, hi))
 
         p.overlay_file = self._overlay_file
         p.opacity = round(random.uniform(self.spin_ov_opacity_min.value(), self.spin_ov_opacity_max.value()), 2)
@@ -471,7 +474,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Video Uniqualizer")
         self.setWindowIcon(app_icon(512))
         self.setMinimumSize(780, 680)
-        self.resize(820, 740)
+        screen = QApplication.primaryScreen()
+        if screen:
+            available = screen.availableGeometry()
+            initial_h = min(740, available.height() - 40)
+            self.resize(820, initial_h)
+        else:
+            self.resize(820, 740)
 
         self.worker = None
         self.input_files = []
@@ -739,23 +748,29 @@ class MainWindow(QMainWindow):
             self.progress_bar.setFormat(f"{current}/{total} — {filename}")
             self.status_label.setText(f"Processing: {filename}")
 
-    def _on_finished(self, success_count):
+    def _on_finished(self, success_count, was_cancelled):
         total = len(self.input_files)
-        self.progress_bar.setValue(100)
-        self.progress_bar.setFormat(f"Done! {success_count}/{total} processed")
-        self.status_label.setText("")
-
         self.btn_process.setVisible(True)
         self.btn_cancel.setVisible(False)
         self.worker = None
         self._update_button_states()
 
-        QMessageBox.information(
-            self,
-            "Processing Complete",
-            f"Successfully processed {success_count} of {total} files.\n\n"
-            f"Output folder: {self.output_folder}"
-        )
+        if was_cancelled:
+            pct = int((success_count / total) * 100) if total > 0 else 0
+            self.progress_bar.setValue(pct)
+            self.progress_bar.setFormat(f"Cancelled — {success_count}/{total} processed")
+            self.status_label.setText("")
+        else:
+            self.progress_bar.setValue(100)
+            self.progress_bar.setFormat(f"Done! {success_count}/{total} processed")
+            self.status_label.setText("")
+
+            QMessageBox.information(
+                self,
+                "Processing Complete",
+                f"Successfully processed {success_count} of {total} files.\n\n"
+                f"Output folder: {self.output_folder}"
+            )
 
     def _on_error(self, error_msg):
         self.progress_bar.setFormat("Error!")

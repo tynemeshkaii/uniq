@@ -97,8 +97,10 @@ python3 "$SRC_DIR/gen_icns.py"
 echo ""
 echo "[4/6] Building .app with PyInstaller (optimized)..."
 
-# Clean previous builds
+# Clean previous builds and PyInstaller's binary cache (can have permission issues after upgrades)
 rm -rf "$DIST_DIR"
+chmod -R u+w ~/Library/Application\ Support/pyinstaller/ 2>/dev/null || true
+rm -rf ~/Library/Application\ Support/pyinstaller/ 2>/dev/null || true
 
 # ===========================================================
 # KEY OPTIMIZATION: exclude all Qt/Python modules we don't use
@@ -250,7 +252,7 @@ done
 
 echo "  Removing unused Qt frameworks..."
 # Remove Qt frameworks/dylibs we don't need
-for fw in QtNetwork QtDBus QtSvg QtOpenGL QtQml QtQuick QtPdf \
+for fw in QtNetwork QtSvg QtOpenGL QtQml QtQuick QtPdf \
           QtMultimedia QtWebEngine QtSql QtTest QtXml QtRemoteObjects \
           QtBluetooth QtNfc QtSensors QtSerialPort QtPositioning \
           QtWebChannel QtWebSockets Qt3D QtCharts QtDataVisualization \
@@ -279,7 +281,7 @@ echo "  Signing .dylib files..."
 find "$APP_DIR" -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
 
 echo "  Signing frameworks..."
-find "$APP_DIR" -type d -name '*.framework' | while read fw; do
+find "$APP_DIR" -type d -name '*.framework' | while IFS= read -r fw; do
     codesign --force --sign - "$fw" 2>/dev/null || true
 done
 

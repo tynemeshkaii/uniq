@@ -114,7 +114,7 @@ class UniqueParams:
 
     @classmethod
     def generate_random(cls) -> 'UniqueParams':
-        """Generate a fully randomized parameter set (the V8.0 defaults)."""
+        """Generate a fully randomized parameter set (V9.0 defaults)."""
         p = cls()
         p.k1 = round(random.uniform(-0.008, 0.008), 4)
         p.rotate = round(random.uniform(-0.7, 0.7), 3)

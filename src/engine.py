@@ -1,5 +1,5 @@
 """
-Video Uniqualization Engine — adapted from HYBRID V8.0 script.
+Video Uniqualization Engine — adapted from HYBRID V9.0 GOD MODE script.
 Provides parameterized video processing via ffmpeg.
 """
 
@@ -99,6 +99,7 @@ class UniqueParams:
     target_width: int = TARGET_WIDTH
     target_height: int = TARGET_HEIGHT
     crf: int = 26
+    gop_size: int = 60  # Broken GOP: randomizes I-frame structure
     preset: str = "fast"
 
     # Meta
@@ -134,13 +135,14 @@ class UniqueParams:
         p.do_hflip = random.choice([True, False])
         p.vignette_angle = round(random.uniform(0.05, 0.25), 2)
 
-        p.video_speed = round(random.uniform(0.96, 1.04), 4)
+        p.video_speed = round(random.uniform(0.97, 1.08), 4)
+        p.gop_size = random.randint(30, 90)
 
         p.trim_start = round(random.uniform(0.1, 0.6), 2)
         p.trim_end = round(random.uniform(0.1, 0.5), 2)
 
         p.pitch = clamp(round(random.uniform(0.96, 1.04), 4), 0.9, 1.1)
-        p.adelay_ms = random.randint(30, 180)
+        p.adelay_ms = random.randint(30, 200)
 
         p.opacity = round(random.uniform(0.04, 0.11), 2)
         p.ov_speed = round(random.uniform(0.88, 1.12), 2)
@@ -313,6 +315,7 @@ def process_single_video(
         "-pix_fmt", "yuv420p",
         "-preset", p.preset,
         "-crf", str(p.crf),
+        "-g", str(p.gop_size),
         "-c:a", "aac",
         "-b:a", "128k",
         "-shortest",

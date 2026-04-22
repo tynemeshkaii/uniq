@@ -311,6 +311,14 @@ class ParamsPanel(QWidget):
         self.spin_crf.setRange(0, 51)
         layout.addLayout(make_param_row("CRF (quality):", self.spin_crf, "0=lossless, 23=default, 51=worst"))
 
+        self.spin_gop_min = QSpinBox()
+        self.spin_gop_min.setRange(10, 300)
+        layout.addLayout(make_param_row("GOP Size Min:", self.spin_gop_min, "Min keyframe interval (Broken GOP)"))
+
+        self.spin_gop_max = QSpinBox()
+        self.spin_gop_max.setRange(10, 300)
+        layout.addLayout(make_param_row("GOP Size Max:", self.spin_gop_max, "Max keyframe interval (Broken GOP)"))
+
         self.combo_preset = QComboBox()
         self.combo_preset.addItems(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"])
         layout.addLayout(make_param_row("Encoding Preset:", self.combo_preset))
@@ -373,7 +381,7 @@ class ParamsPanel(QWidget):
         self.overlay_path_label.setToolTip("")
 
     def load_defaults(self):
-        """Load the V8.0 script defaults."""
+        """Load the V9.0 script defaults."""
         self.spin_zoom_min.setValue(1.02)
         self.spin_zoom_max.setValue(1.05)
         self.spin_rotate_max.setValue(0.7)
@@ -398,16 +406,18 @@ class ParamsPanel(QWidget):
         self.spin_unsharp_max.setValue(0.6)
         self.spin_vignette_min.setValue(0.05)
         self.spin_vignette_max.setValue(0.25)
-        self.spin_speed_min.setValue(0.96)
-        self.spin_speed_max.setValue(1.04)
+        self.spin_speed_min.setValue(0.97)
+        self.spin_speed_max.setValue(1.08)
         self.spin_pitch_min.setValue(0.96)
         self.spin_pitch_max.setValue(1.04)
         self.spin_adelay_min.setValue(30)
-        self.spin_adelay_max.setValue(180)
+        self.spin_adelay_max.setValue(200)
 
         self.spin_width.setValue(1080)
         self.spin_height.setValue(1920)
-        self.spin_crf.setValue(26)
+        self.spin_crf.setValue(24)
+        self.spin_gop_min.setValue(30)
+        self.spin_gop_max.setValue(90)
         self.combo_preset.setCurrentText("fast")
         self.chk_fake_meta.setChecked(True)
 
@@ -460,6 +470,8 @@ class ParamsPanel(QWidget):
         p.target_width = self.spin_width.value()
         p.target_height = self.spin_height.value()
         p.crf = self.spin_crf.value()
+        lo, hi = self.spin_gop_min.value(), self.spin_gop_max.value()
+        p.gop_size = random.randint(min(lo, hi), max(lo, hi))
         p.preset = self.combo_preset.currentText()
         p.fake_meta = self.chk_fake_meta.isChecked()
 
@@ -536,7 +548,7 @@ class MainWindow(QMainWindow):
         t1 = QLabel("Video Uniqualizer")
         t1.setObjectName("appTitle")
         titles.addWidget(t1)
-        t2 = QLabel("HYBRID V8.0 — MAXIMUM UNIQUE")
+        t2 = QLabel("HYBRID V9.0 GOD MODE — MAXIMUM UNIQUE")
         t2.setObjectName("appSubtitle")
         titles.addWidget(t2)
         lay.addLayout(titles)

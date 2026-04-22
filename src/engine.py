@@ -342,7 +342,8 @@ def process_single_video(
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return result.returncode == 0
-    except OSError:
+    except OSError as exc:
+        print(f"[engine] ffmpeg failed to launch: {exc}", file=sys.stderr)
         return False
 
 

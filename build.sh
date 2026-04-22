@@ -252,7 +252,7 @@ done
 
 echo "  Removing unused Qt frameworks..."
 # Remove Qt frameworks/dylibs we don't need
-for fw in QtNetwork QtSvg QtOpenGL QtQml QtQuick QtPdf \
+for fw in QtNetwork QtDBus QtSvg QtOpenGL QtQml QtQuick QtPdf \
           QtMultimedia QtWebEngine QtSql QtTest QtXml QtRemoteObjects \
           QtBluetooth QtNfc QtSensors QtSerialPort QtPositioning \
           QtWebChannel QtWebSockets Qt3D QtCharts QtDataVisualization \

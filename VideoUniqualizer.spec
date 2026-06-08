@@ -20,7 +20,8 @@ datas = [
     (os.path.join(SRC_DIR, 'styles.py'), '.'),
 ]
 
-# Add ffmpeg binaries if they exist
+# Add ffmpeg binaries if they exist. For best macOS performance, these should
+# be native or universal binaries for the target architecture.
 if os.path.isfile(os.path.join(FFMPEG_DIR, 'ffmpeg')):
     datas.append((os.path.join(FFMPEG_DIR, 'ffmpeg'), 'ffmpeg'))
 if os.path.isfile(os.path.join(FFMPEG_DIR, 'ffprobe')):

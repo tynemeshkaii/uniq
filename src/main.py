@@ -5,6 +5,7 @@ Main window with skeuomorphic design.
 
 import sys
 import os
+import traceback
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QFileDialog,
@@ -12,22 +13,55 @@ from PyQt6.QtWidgets import (
     QComboBox, QTabWidget, QScrollArea, QFrame, QSizePolicy,
     QAbstractItemView, QGridLayout, QMessageBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, QUrl, QMimeData
 from PyQt6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent
 
-from engine import UniqueParams, process_batch
+from engine import (
+    ENCODER_H264_VIDEOTOOLBOX,
+    ENCODER_LABELS,
+    ENCODER_LIBX264,
+    PERFORMANCE_PROFILE_BALANCED,
+    PERFORMANCE_PROFILE_FAST_MAC,
+    PERFORMANCE_PROFILE_LABELS,
+    PERFORMANCE_PROFILE_QUALITY,
+    UniqueParams,
+    available_video_encoders,
+    benchmark_video_encoders,
+    check_ffmpeg_available,
+    process_batch,
+)
 from icons import (
     app_icon, file_select_icon, output_folder_icon,
     process_icon, settings_icon, remove_icon
 )
 from styles import MAIN_STYLESHEET
 
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
+
+
+def _install_exception_hook():
+    """Show a dialog on unhandled exceptions instead of silent crash."""
+    def _handler(exc_type, exc_value, exc_tb):
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        print(tb_text, file=sys.stderr)
+        try:
+            QMessageBox.critical(
+                None,
+                "Unexpected Error",
+                f"An unexpected error occurred:\n\n{exc_value}\n\n"
+                f"Details have been printed to stderr.",
+            )
+        except Exception:
+            pass
+    sys.excepthook = _handler
+
 
 # ─── Worker Thread ──────────────────────────────────────
 
 class ProcessWorker(QThread):
     progress = pyqtSignal(int, int, str)   # current, total, filename
-    finished = pyqtSignal(int, bool)        # success_count, was_cancelled
+    file_progress = pyqtSignal(float)      # 0.0–1.0 within current file
+    finished = pyqtSignal(int, bool, list)  # success_count, was_cancelled, errors
     error = pyqtSignal(str)
 
     def __init__(self, files, output_folder, params, parent=None):
@@ -45,17 +79,65 @@ class ProcessWorker(QThread):
 
     def run(self):
         try:
-            count = process_batch(
+            count, errors = process_batch(
                 input_files=self.files,
                 output_folder=self.output_folder,
                 params_template=self.params,
                 randomize_each=True,
                 progress_callback=lambda cur, tot, fn: self.progress.emit(cur, tot, fn),
+                file_progress_callback=lambda pct: self.file_progress.emit(pct),
                 cancelled=self.is_cancelled,
             )
-            self.finished.emit(count, self._cancelled)
+            self.finished.emit(count, self._cancelled, errors)
         except Exception as e:
             self.error.emit(str(e))
+
+
+# ─── Drag & Drop File List ──────────────────────────────
+
+class VideoFileList(QListWidget):
+    """QListWidget that accepts video file drops from Finder."""
+    files_dropped = pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent):
+        if not event.mimeData().hasUrls():
+            super().dropEvent(event)
+            return
+
+        paths = []
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if not path:
+                continue
+            if os.path.isfile(path):
+                ext = os.path.splitext(path)[1].lower()
+                if ext in VIDEO_EXTENSIONS:
+                    paths.append(path)
+            elif os.path.isdir(path):
+                for root, _, files in os.walk(path):
+                    for f in files:
+                        ext = os.path.splitext(f)[1].lower()
+                        if ext in VIDEO_EXTENSIONS:
+                            paths.append(os.path.join(root, f))
+        if paths:
+            self.files_dropped.emit(paths)
+        event.acceptProposedAction()
 
 
 # ─── Helper Widgets ─────────────────────────────────────
@@ -92,6 +174,11 @@ def make_param_row(label_text: str, widget: QWidget, tooltip: str = "") -> QHBox
     row.addWidget(lbl)
     row.addWidget(widget, 1)
     return row
+
+
+def _safe_range(a: float, b: float) -> tuple:
+    """Ensure min ≤ max for random.uniform / random.randint calls."""
+    return (min(a, b), max(a, b))
 
 
 # ─── Parameters Panel ───────────────────────────────────
@@ -152,8 +239,8 @@ class ParamsPanel(QWidget):
         self.spin_crop_max.setRange(0, 40)
         layout.addLayout(make_param_row("Crop Margin Max (px):", self.spin_crop_max, "Max micro-crop pixels"))
 
-        self.chk_hflip = QCheckBox("Enable random horizontal flip (50% chance)")
-        layout.addWidget(self.chk_hflip)
+        self.chk_subpixel = QCheckBox("Sub-pixel shift (invisible, resamples all pixels)")
+        layout.addWidget(self.chk_subpixel)
 
         self.spin_trim_start_max = QDoubleSpinBox()
         self.spin_trim_start_max.setRange(0.0, 3.0)
@@ -216,6 +303,9 @@ class ParamsPanel(QWidget):
         self.spin_hue_max.setDecimals(1)
         self.spin_hue_max.setSingleStep(1.0)
         layout.addLayout(make_param_row("Hue Shift Max (°):", self.spin_hue_max, "Max hue rotation (+/-)"))
+
+        self.chk_gamma = QCheckBox("Gamma micro-shift (invisible, breaks perceptual hash)")
+        layout.addWidget(self.chk_gamma)
 
         layout.addStretch()
         return w
@@ -289,6 +379,15 @@ class ParamsPanel(QWidget):
         self.spin_adelay_max.setRange(0, 500)
         layout.addLayout(make_param_row("Audio Delay Max (ms):", self.spin_adelay_max))
 
+        self.chk_audio_eq = QCheckBox("Inaudible frequency EQ (breaks audio fingerprint)")
+        layout.addWidget(self.chk_audio_eq)
+
+        self.chk_audio_resample = QCheckBox("Audio sample rate round-trip (invisible, resamples all audio)")
+        layout.addWidget(self.chk_audio_resample)
+
+        self.chk_chroma_roundtrip = QCheckBox("Chroma subsampling round-trip (invisible, changes all color values)")
+        layout.addWidget(self.chk_chroma_roundtrip)
+
         layout.addStretch()
         return w
 
@@ -311,6 +410,27 @@ class ParamsPanel(QWidget):
         self.spin_crf.setRange(0, 51)
         layout.addLayout(make_param_row("CRF (quality):", self.spin_crf, "0=lossless, 23=default, 51=worst"))
 
+        self.combo_performance = QComboBox()
+        for key, label in PERFORMANCE_PROFILE_LABELS.items():
+            self.combo_performance.addItem(label, key)
+        self.combo_performance.currentIndexChanged.connect(self._apply_performance_profile)
+        layout.addLayout(make_param_row("macOS Profile:", self.combo_performance, "Fast Mac reduces expensive filters and favors hardware encoding"))
+
+        self.combo_encoder = QComboBox()
+        available = available_video_encoders()
+        for key, label in ENCODER_LABELS.items():
+            self.combo_encoder.addItem(label, key)
+            if key not in available:
+                idx = self.combo_encoder.count() - 1
+                self.combo_encoder.model().item(idx).setEnabled(False)
+        layout.addLayout(make_param_row("Video Encoder:", self.combo_encoder, "VideoToolbox uses native macOS hardware acceleration when available"))
+
+        self.spin_video_bitrate = QSpinBox()
+        self.spin_video_bitrate.setRange(1000, 80000)
+        self.spin_video_bitrate.setSingleStep(500)
+        self.spin_video_bitrate.setSuffix(" kbps")
+        layout.addLayout(make_param_row("HW Bitrate:", self.spin_video_bitrate, "Used by VideoToolbox encoders"))
+
         self.spin_gop_min = QSpinBox()
         self.spin_gop_min.setRange(10, 300)
         layout.addLayout(make_param_row("GOP Size Min:", self.spin_gop_min, "Min keyframe interval (Broken GOP)"))
@@ -325,6 +445,9 @@ class ParamsPanel(QWidget):
 
         self.chk_fake_meta = QCheckBox("Write fake camera metadata (EXIF)")
         layout.addWidget(self.chk_fake_meta)
+
+        self.chk_x264_tuning = QCheckBox("Randomize x264 encoding params (deblock, aq, psy-rd)")
+        layout.addWidget(self.chk_x264_tuning)
 
         # Overlay section
         layout.addWidget(make_separator())
@@ -388,7 +511,7 @@ class ParamsPanel(QWidget):
         self.spin_k1_max.setValue(0.008)
         self.spin_crop_min.setValue(4)
         self.spin_crop_max.setValue(16)
-        self.chk_hflip.setChecked(False)
+
         self.spin_trim_start_max.setValue(0.6)
         self.spin_trim_end_max.setValue(0.5)
 
@@ -419,12 +542,49 @@ class ParamsPanel(QWidget):
         self.spin_gop_min.setValue(30)
         self.spin_gop_max.setValue(90)
         self.combo_preset.setCurrentText("fast")
+        self.combo_performance.setCurrentIndex(self.combo_performance.findData(PERFORMANCE_PROFILE_BALANCED))
+        preferred_encoder = ENCODER_H264_VIDEOTOOLBOX
+        idx = self.combo_encoder.findData(preferred_encoder)
+        if idx >= 0 and self.combo_encoder.model().item(idx).isEnabled():
+            self.combo_encoder.setCurrentIndex(idx)
+        else:
+            self.combo_encoder.setCurrentIndex(self.combo_encoder.findData(ENCODER_LIBX264))
+        self.spin_video_bitrate.setValue(8000)
         self.chk_fake_meta.setChecked(True)
+        self.chk_subpixel.setChecked(True)
+        self.chk_gamma.setChecked(True)
+        self.chk_audio_eq.setChecked(True)
+        self.chk_audio_resample.setChecked(True)
+        self.chk_chroma_roundtrip.setChecked(True)
+        self.chk_x264_tuning.setChecked(True)
 
         self.spin_ov_opacity_min.setValue(0.04)
         self.spin_ov_opacity_max.setValue(0.11)
         self._overlay_file = ""
         self.overlay_path_label.setText("No overlay selected")
+
+    def _apply_performance_profile(self):
+        profile = self.combo_performance.currentData()
+        if profile == PERFORMANCE_PROFILE_FAST_MAC:
+            idx = self.combo_encoder.findData(ENCODER_H264_VIDEOTOOLBOX)
+            if idx >= 0 and self.combo_encoder.model().item(idx).isEnabled():
+                self.combo_encoder.setCurrentIndex(idx)
+            self.combo_preset.setCurrentText("veryfast")
+            self.spin_video_bitrate.setValue(9000)
+            self.chk_chroma_roundtrip.setChecked(False)
+            self.chk_audio_resample.setChecked(False)
+        elif profile == PERFORMANCE_PROFILE_QUALITY:
+            idx = self.combo_encoder.findData(ENCODER_LIBX264)
+            if idx >= 0:
+                self.combo_encoder.setCurrentIndex(idx)
+            self.combo_preset.setCurrentText("slow")
+            self.spin_video_bitrate.setValue(12000)
+        else:
+            idx = self.combo_encoder.findData(ENCODER_H264_VIDEOTOOLBOX)
+            if idx >= 0 and self.combo_encoder.model().item(idx).isEnabled():
+                self.combo_encoder.setCurrentIndex(idx)
+            self.combo_preset.setCurrentText("fast")
+            self.spin_video_bitrate.setValue(8000)
 
     def build_params(self) -> UniqueParams:
         """Build a UniqueParams template from current UI values."""
@@ -434,44 +594,84 @@ class ParamsPanel(QWidget):
         p = UniqueParams()
         p.k1 = round(random.uniform(-self.spin_k1_max.value(), self.spin_k1_max.value()), 4)
         p.rotate = round(random.uniform(-self.spin_rotate_max.value(), self.spin_rotate_max.value()), 3)
-        p.zoom = round(random.uniform(self.spin_zoom_min.value(), self.spin_zoom_max.value()), 3)
-        lo, hi = self.spin_crop_min.value(), self.spin_crop_max.value()
-        p.crop_margin = random.randint(min(lo, hi), max(lo, hi))
+
+        lo, hi = _safe_range(self.spin_zoom_min.value(), self.spin_zoom_max.value())
+        p.zoom = round(random.uniform(lo, hi), 3)
+
+        lo, hi = _safe_range(self.spin_crop_min.value(), self.spin_crop_max.value())
+        p.crop_margin = random.randint(int(lo), int(hi))
 
         cs = self.spin_color_shift.value()
         p.rs = round(random.uniform(-cs, cs), 3)
         p.gs = round(random.uniform(-cs, cs), 3)
         p.bs = round(random.uniform(-cs, cs), 3)
-        p.contrast = round(random.uniform(self.spin_contrast_min.value(), self.spin_contrast_max.value()), 3)
-        p.saturation = round(random.uniform(self.spin_sat_min.value(), self.spin_sat_max.value()), 3)
+
+        lo, hi = _safe_range(self.spin_contrast_min.value(), self.spin_contrast_max.value())
+        p.contrast = round(random.uniform(lo, hi), 3)
+
+        lo, hi = _safe_range(self.spin_sat_min.value(), self.spin_sat_max.value())
+        p.saturation = round(random.uniform(lo, hi), 3)
+
         p.brightness = round(random.uniform(-self.spin_bright_max.value(), self.spin_bright_max.value()), 3)
         p.hue_shift = round(random.uniform(-self.spin_hue_max.value(), self.spin_hue_max.value()), 1)
 
-        p.unsharp_amount = round(random.uniform(self.spin_unsharp_min.value(), self.spin_unsharp_max.value()), 2)
-        lo, hi = self.spin_noise_min.value(), self.spin_noise_max.value()
-        p.noise_strength = random.randint(min(lo, hi), max(lo, hi))
-        p.noise_flags = random.choice(["t", "u", "t+u"])
-        p.do_hflip = self.chk_hflip.isChecked() and random.choice([True, False])
-        p.vignette_angle = round(random.uniform(self.spin_vignette_min.value(), self.spin_vignette_max.value()), 2)
+        lo, hi = _safe_range(self.spin_unsharp_min.value(), self.spin_unsharp_max.value())
+        p.unsharp_amount = round(random.uniform(lo, hi), 2)
 
-        p.video_speed = round(random.uniform(self.spin_speed_min.value(), self.spin_speed_max.value()), 4)
+        lo, hi = _safe_range(self.spin_noise_min.value(), self.spin_noise_max.value())
+        p.noise_strength = random.randint(int(lo), int(hi))
+        p.noise_flags = random.choice(["t", "u", "t+u"])
+
+        lo, hi = _safe_range(self.spin_vignette_min.value(), self.spin_vignette_max.value())
+        p.vignette_angle = round(random.uniform(lo, hi), 2)
+
+        if self.chk_gamma.isChecked():
+            p.gamma = round(random.uniform(0.98, 1.02), 3)
+        if self.chk_subpixel.isChecked():
+            p.subpixel_x = round(random.uniform(0.3, 0.7), 2)
+            p.subpixel_y = round(random.uniform(0.3, 0.7), 2)
+
+        lo, hi = _safe_range(self.spin_speed_min.value(), self.spin_speed_max.value())
+        p.video_speed = round(random.uniform(lo, hi), 4)
 
         p.trim_start = round(random.uniform(0.1, self.spin_trim_start_max.value()), 2)
         p.trim_end = round(random.uniform(0.1, self.spin_trim_end_max.value()), 2)
 
-        p.pitch = clamp(round(random.uniform(self.spin_pitch_min.value(), self.spin_pitch_max.value()), 4), 0.9, 1.1)
-        lo, hi = self.spin_adelay_min.value(), self.spin_adelay_max.value()
-        p.adelay_ms = random.randint(min(lo, hi), max(lo, hi))
+        lo, hi = _safe_range(self.spin_pitch_min.value(), self.spin_pitch_max.value())
+        p.pitch = clamp(round(random.uniform(lo, hi), 4), 0.9, 1.1)
+
+        lo, hi = _safe_range(self.spin_adelay_min.value(), self.spin_adelay_max.value())
+        p.adelay_ms = random.randint(int(lo), int(hi))
+
+        if self.chk_audio_eq.isChecked():
+            p.audio_highpass = random.randint(25, 45)
+            p.audio_lowpass = random.randint(16000, 18000)
+
+        p.do_audio_resample = self.chk_audio_resample.isChecked()
+        p.do_chroma_roundtrip = self.chk_chroma_roundtrip.isChecked()
+
+        if self.chk_x264_tuning.isChecked():
+            p.deblock_alpha = random.randint(-3, 3)
+            p.deblock_beta = random.randint(-3, 3)
+            p.aq_strength = round(random.uniform(0.8, 1.2), 2)
+            p.psy_rd = round(random.uniform(0.8, 1.2), 2)
+            p.qcomp = round(random.uniform(0.5, 0.7), 2)
 
         p.overlay_file = self._overlay_file
-        p.opacity = round(random.uniform(self.spin_ov_opacity_min.value(), self.spin_ov_opacity_max.value()), 2)
+
+        lo, hi = _safe_range(self.spin_ov_opacity_min.value(), self.spin_ov_opacity_max.value())
+        p.opacity = round(random.uniform(lo, hi), 2)
         p.ov_speed = round(random.uniform(0.88, 1.12), 2)
 
         p.target_width = self.spin_width.value()
         p.target_height = self.spin_height.value()
         p.crf = self.spin_crf.value()
-        lo, hi = self.spin_gop_min.value(), self.spin_gop_max.value()
-        p.gop_size = random.randint(min(lo, hi), max(lo, hi))
+        p.performance_profile = self.combo_performance.currentData() or PERFORMANCE_PROFILE_BALANCED
+        p.encoder = self.combo_encoder.currentData() or ENCODER_LIBX264
+        p.video_bitrate_kbps = self.spin_video_bitrate.value()
+
+        lo, hi = _safe_range(self.spin_gop_min.value(), self.spin_gop_max.value())
+        p.gop_size = random.randint(int(lo), int(hi))
         p.preset = self.combo_preset.currentText()
         p.fake_meta = self.chk_fake_meta.isChecked()
 
@@ -497,6 +697,8 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.input_files = []
         self.output_folder = ""
+        self._current_file_index = 0
+        self._current_file_total = 0
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -590,16 +792,16 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(input_header)
 
-        # File list
-        self.file_list = QListWidget()
+        # File list with drag & drop
+        self.file_list = VideoFileList()
         self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.file_list.setMinimumHeight(120)
         self.file_list.setMaximumHeight(200)
-        self.file_list.setAcceptDrops(True)
         self.file_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.file_list.files_dropped.connect(self._add_files)
         layout.addWidget(self.file_list)
 
-        self.file_count_label = QLabel("No files selected")
+        self.file_count_label = QLabel("No files selected — drag & drop video files here")
         self.file_count_label.setObjectName("statusLabel")
         layout.addWidget(self.file_count_label)
 
@@ -636,13 +838,22 @@ class MainWindow(QMainWindow):
     def _build_action_section(self) -> QWidget:
         card, layout = make_panel()
 
-        # Progress
+        # Overall progress
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Ready")
         self.progress_bar.setFixedHeight(28)
         layout.addWidget(self.progress_bar)
+
+        # Per-file progress
+        self.file_progress_bar = QProgressBar()
+        self.file_progress_bar.setRange(0, 1000)
+        self.file_progress_bar.setValue(0)
+        self.file_progress_bar.setFormat("")
+        self.file_progress_bar.setFixedHeight(16)
+        self.file_progress_bar.setVisible(False)
+        layout.addWidget(self.file_progress_bar)
 
         self.status_label = QLabel("")
         self.status_label.setObjectName("statusLabel")
@@ -672,6 +883,17 @@ class MainWindow(QMainWindow):
 
     # ─── Slots ───────────────────────────────────────────
 
+    def _add_files(self, paths: list):
+        """Add files from drag-drop or file dialog, deduplicating."""
+        for p in paths:
+            if p not in self.input_files:
+                self.input_files.append(p)
+                item = QListWidgetItem(os.path.basename(p))
+                item.setToolTip(p)
+                self.file_list.addItem(item)
+        self._update_file_count()
+        self._update_button_states()
+
     def _select_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -680,14 +902,7 @@ class MainWindow(QMainWindow):
             "Video Files (*.mp4 *.mov *.avi *.mkv *.webm *.flv *.wmv);;All Files (*)"
         )
         if paths:
-            for p in paths:
-                if p not in self.input_files:
-                    self.input_files.append(p)
-                    item = QListWidgetItem(os.path.basename(p))
-                    item.setToolTip(p)
-                    self.file_list.addItem(item)
-            self._update_file_count()
-            self._update_button_states()
+            self._add_files(paths)
 
     def _remove_selected(self):
         for item in reversed(self.file_list.selectedItems()):
@@ -718,13 +933,19 @@ class MainWindow(QMainWindow):
     def _update_file_count(self):
         n = len(self.input_files)
         if n == 0:
-            self.file_count_label.setText("No files selected")
+            self.file_count_label.setText("No files selected — drag & drop video files here")
         else:
             self.file_count_label.setText(f"{n} file{'s' if n != 1 else ''} selected")
 
     def _update_button_states(self):
         can_start = len(self.input_files) > 0 and bool(self.output_folder)
         self.btn_process.setEnabled(can_start and self.worker is None)
+
+    def _cleanup_worker(self):
+        """Safely wait for and discard worker thread."""
+        if self.worker is not None:
+            self.worker.wait(5000)
+            self.worker = None
 
     def _start_processing(self):
         if not self.input_files or not self.output_folder:
@@ -737,13 +958,19 @@ class MainWindow(QMainWindow):
             params=params,
         )
         self.worker.progress.connect(self._on_progress)
+        self.worker.file_progress.connect(self._on_file_progress)
         self.worker.finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
+
+        self._current_file_index = 0
+        self._current_file_total = len(self.input_files)
 
         self.btn_process.setVisible(False)
         self.btn_cancel.setVisible(True)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Starting...")
+        self.file_progress_bar.setValue(0)
+        self.file_progress_bar.setVisible(True)
         self._update_button_states()
 
         self.worker.start()
@@ -751,7 +978,8 @@ class MainWindow(QMainWindow):
     def _cancel_processing(self):
         if self.worker:
             self.worker.cancel()
-            self.status_label.setText("Cancelling...")
+            self.status_label.setText("Cancelling (waiting for ffmpeg to stop)...")
+            self.btn_cancel.setEnabled(False)
 
     def _on_progress(self, current, total, filename):
         if total > 0:
@@ -759,12 +987,21 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(pct)
             self.progress_bar.setFormat(f"{current}/{total} — {filename}")
             self.status_label.setText(f"Processing: {filename}")
+            self._current_file_index = current
+            self.file_progress_bar.setValue(0)
 
-    def _on_finished(self, success_count, was_cancelled):
+    def _on_file_progress(self, fraction):
+        self.file_progress_bar.setValue(int(fraction * 1000))
+        pct = int(fraction * 100)
+        self.file_progress_bar.setFormat(f"Encoding: {pct}%")
+
+    def _on_finished(self, success_count, was_cancelled, errors):
         total = len(self.input_files)
         self.btn_process.setVisible(True)
         self.btn_cancel.setVisible(False)
-        self.worker = None
+        self.btn_cancel.setEnabled(True)
+        self.file_progress_bar.setVisible(False)
+        self._cleanup_worker()
         self._update_button_states()
 
         if was_cancelled:
@@ -777,19 +1014,22 @@ class MainWindow(QMainWindow):
             self.progress_bar.setFormat(f"Done! {success_count}/{total} processed")
             self.status_label.setText("")
 
-            QMessageBox.information(
-                self,
-                "Processing Complete",
-                f"Successfully processed {success_count} of {total} files.\n\n"
-                f"Output folder: {self.output_folder}"
-            )
+            msg = f"Successfully processed {success_count} of {total} files.\n\nOutput folder: {self.output_folder}"
+            if errors:
+                msg += f"\n\nErrors ({len(errors)}):\n" + "\n".join(errors[:10])
+                if len(errors) > 10:
+                    msg += f"\n... and {len(errors) - 10} more"
+
+            QMessageBox.information(self, "Processing Complete", msg)
 
     def _on_error(self, error_msg):
         self.progress_bar.setFormat("Error!")
         self.status_label.setText(f"Error: {error_msg}")
         self.btn_process.setVisible(True)
         self.btn_cancel.setVisible(False)
-        self.worker = None
+        self.btn_cancel.setEnabled(True)
+        self.file_progress_bar.setVisible(False)
+        self._cleanup_worker()
         self._update_button_states()
 
         QMessageBox.critical(self, "Error", f"Processing failed:\n{error_msg}")
@@ -798,11 +1038,38 @@ class MainWindow(QMainWindow):
 # ─── Entry Point ────────────────────────────────────────
 
 def main():
+    _install_exception_hook()
+
+    if "--benchmark" in sys.argv:
+        ok, err = check_ffmpeg_available()
+        if not ok:
+            print(f"ffmpeg unavailable: {err}", file=sys.stderr)
+            sys.exit(1)
+        print("Video Uniqualizer macOS encoder benchmark")
+        for row in benchmark_video_encoders():
+            if not row["available"]:
+                print(f"- {row['encoder']}: unavailable")
+            elif row["error"]:
+                print(f"- {row['encoder']}: failed after {row['seconds']}s: {row['error']}")
+            else:
+                print(f"- {row['encoder']}: {row['seconds']}s, {row['fps']} fps, {row['size_mb']} MB")
+        return
+
     app = QApplication(sys.argv)
     app.setApplicationName("Video Uniqualizer")
     app.setApplicationDisplayName("Video Uniqualizer")
     app.setStyleSheet(MAIN_STYLESHEET)
     app.setWindowIcon(app_icon(512))
+
+    ok, err = check_ffmpeg_available()
+    if not ok:
+        QMessageBox.critical(
+            None,
+            "ffmpeg Not Found",
+            f"Video Uniqualizer requires ffmpeg to work.\n\n{err}\n\n"
+            f"Install ffmpeg: brew install ffmpeg",
+        )
+        sys.exit(1)
 
     window = MainWindow()
     window.show()

@@ -3,6 +3,7 @@ Programmatically drawn icons and graphics for the Video Uniqualizer app.
 All icons are rendered via QPainter — no external image files needed.
 """
 
+import functools
 from PyQt6.QtCore import Qt, QRect, QRectF, QPointF, QSize
 from PyQt6.QtGui import (
     QIcon, QPixmap, QPainter, QColor, QLinearGradient, QRadialGradient,
@@ -83,6 +84,7 @@ def draw_app_icon(p: QPainter, s: int):
         p.drawLine(QPointF(sx2, sy2 - arm), QPointF(sx2, sy2 + arm))
 
 
+@functools.lru_cache(maxsize=4)
 def app_icon(size=512) -> QIcon:
     return make_icon(size, draw_app_icon)
 
@@ -137,6 +139,7 @@ def draw_file_icon(p: QPainter, s: int):
     p.drawLine(QPointF(cx2, cy2 - s * 0.07), QPointF(cx2, cy2 + s * 0.07))
 
 
+@functools.lru_cache(maxsize=4)
 def file_select_icon(size=64) -> QIcon:
     return make_icon(size, draw_file_icon)
 
@@ -176,6 +179,7 @@ def draw_output_icon(p: QPainter, s: int):
     p.drawLine(QPointF(cx + s * 0.1, s * 0.58), QPointF(cx, s * 0.68))
 
 
+@functools.lru_cache(maxsize=4)
 def output_folder_icon(size=64) -> QIcon:
     return make_icon(size, draw_output_icon)
 
@@ -223,6 +227,7 @@ def draw_process_icon(p: QPainter, s: int):
         p.drawLine(QPointF(sx2, sy2 - arm), QPointF(sx2, sy2 + arm))
 
 
+@functools.lru_cache(maxsize=4)
 def process_icon(size=64) -> QIcon:
     return make_icon(size, draw_process_icon)
 
@@ -265,6 +270,7 @@ def draw_settings_icon(p: QPainter, s: int):
     p.drawEllipse(QRectF(cx - s * 0.12, cy - s * 0.12, s * 0.24, s * 0.24))
 
 
+@functools.lru_cache(maxsize=4)
 def settings_icon(size=64) -> QIcon:
     return make_icon(size, draw_settings_icon)
 
@@ -279,6 +285,7 @@ def draw_remove_icon(p: QPainter, s: int):
     p.drawLine(QPointF(s - margin, margin), QPointF(margin, s - margin))
 
 
+@functools.lru_cache(maxsize=4)
 def remove_icon(size=32) -> QIcon:
     return make_icon(size, draw_remove_icon)
 
@@ -299,5 +306,6 @@ def draw_preset_icon(p: QPainter, s: int):
         p.setPen(QPen(QColor(140, 140, 160), s * 0.04))
 
 
+@functools.lru_cache(maxsize=4)
 def preset_icon(size=32) -> QIcon:
     return make_icon(size, draw_preset_icon)

@@ -414,7 +414,7 @@ class ParamsPanel(QWidget):
         for key, label in PERFORMANCE_PROFILE_LABELS.items():
             self.combo_performance.addItem(label, key)
         self.combo_performance.currentIndexChanged.connect(self._apply_performance_profile)
-        layout.addLayout(make_param_row("macOS Profile:", self.combo_performance, "Fast Mac reduces expensive filters and favors hardware encoding"))
+        layout.addLayout(make_param_row("macOS Profile:", self.combo_performance, "Max Quality keeps the full uniqueness filter chain and libx264 encoder"))
 
         self.combo_encoder = QComboBox()
         available = available_video_encoders()
@@ -423,7 +423,7 @@ class ParamsPanel(QWidget):
             if key not in available:
                 idx = self.combo_encoder.count() - 1
                 self.combo_encoder.model().item(idx).setEnabled(False)
-        layout.addLayout(make_param_row("Video Encoder:", self.combo_encoder, "VideoToolbox uses native macOS hardware acceleration when available"))
+        layout.addLayout(make_param_row("Video Encoder:", self.combo_encoder, "libx264 is recommended for maximum uniqueness; VideoToolbox is optional"))
 
         self.spin_video_bitrate = QSpinBox()
         self.spin_video_bitrate.setRange(1000, 80000)
@@ -542,13 +542,8 @@ class ParamsPanel(QWidget):
         self.spin_gop_min.setValue(30)
         self.spin_gop_max.setValue(90)
         self.combo_preset.setCurrentText("fast")
-        self.combo_performance.setCurrentIndex(self.combo_performance.findData(PERFORMANCE_PROFILE_BALANCED))
-        preferred_encoder = ENCODER_H264_VIDEOTOOLBOX
-        idx = self.combo_encoder.findData(preferred_encoder)
-        if idx >= 0 and self.combo_encoder.model().item(idx).isEnabled():
-            self.combo_encoder.setCurrentIndex(idx)
-        else:
-            self.combo_encoder.setCurrentIndex(self.combo_encoder.findData(ENCODER_LIBX264))
+        self.combo_performance.setCurrentIndex(self.combo_performance.findData(PERFORMANCE_PROFILE_QUALITY))
+        self.combo_encoder.setCurrentIndex(self.combo_encoder.findData(ENCODER_LIBX264))
         self.spin_video_bitrate.setValue(8000)
         self.chk_fake_meta.setChecked(True)
         self.chk_subpixel.setChecked(True)
@@ -571,8 +566,6 @@ class ParamsPanel(QWidget):
                 self.combo_encoder.setCurrentIndex(idx)
             self.combo_preset.setCurrentText("veryfast")
             self.spin_video_bitrate.setValue(9000)
-            self.chk_chroma_roundtrip.setChecked(False)
-            self.chk_audio_resample.setChecked(False)
         elif profile == PERFORMANCE_PROFILE_QUALITY:
             idx = self.combo_encoder.findData(ENCODER_LIBX264)
             if idx >= 0:
@@ -580,8 +573,8 @@ class ParamsPanel(QWidget):
             self.combo_preset.setCurrentText("slow")
             self.spin_video_bitrate.setValue(12000)
         else:
-            idx = self.combo_encoder.findData(ENCODER_H264_VIDEOTOOLBOX)
-            if idx >= 0 and self.combo_encoder.model().item(idx).isEnabled():
+            idx = self.combo_encoder.findData(ENCODER_LIBX264)
+            if idx >= 0:
                 self.combo_encoder.setCurrentIndex(idx)
             self.combo_preset.setCurrentText("fast")
             self.spin_video_bitrate.setValue(8000)

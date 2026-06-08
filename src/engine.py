@@ -539,12 +539,10 @@ def process_single_video(
     if has_overlay:
         inputs.extend(["-stream_loop", "-1", "-i", overlay_path])
 
-    fast_mac = p.performance_profile == PERFORMANCE_PROFILE_FAST_MAC
-
     # VIDEO FILTERS
-    subpixel_crop = f"crop=iw-2:ih-2:{p.subpixel_x}:{p.subpixel_y}," if ((p.subpixel_x > 0 or p.subpixel_y > 0) and not fast_mac) else ""
-    gamma_filter = f"lutyuv=y=gammaval({p.gamma})," if (p.gamma != 1.0 and not fast_mac) else ""
-    chroma_rt = "format=yuv444p,format=yuv420p," if (p.do_chroma_roundtrip and not fast_mac) else ""
+    subpixel_crop = f"crop=iw-2:ih-2:{p.subpixel_x}:{p.subpixel_y}," if (p.subpixel_x > 0 or p.subpixel_y > 0) else ""
+    gamma_filter = f"lutyuv=y=gammaval({p.gamma})," if p.gamma != 1.0 else ""
+    chroma_rt = "format=yuv444p,format=yuv420p," if p.do_chroma_roundtrip else ""
 
     tw, th = p.target_width, p.target_height
     cm = p.crop_margin
@@ -557,15 +555,12 @@ def process_single_video(
         f"scale={tw}:{th}:force_original_aspect_ratio=decrease"
     )
 
-    lens_filter = "" if fast_mac else f"lenscorrection=k1={p.k1}:k2={p.k1},"
-    rotate_filter = "" if fast_mac else f"rotate={p.rotate}*PI/180:fillcolor=none,"
-    unsharp_filter = "" if fast_mac else f"unsharp=5:5:{p.unsharp_amount}:5:5:0.0,"
-    noise_strength = min(p.noise_strength, 4) if fast_mac else p.noise_strength
+    lens_filter = f"lenscorrection=k1={p.k1}:k2={p.k1},"
+    rotate_filter = f"rotate={p.rotate}*PI/180:fillcolor=none,"
+    unsharp_filter = f"unsharp=5:5:{p.unsharp_amount}:5:5:0.0,"
+    noise_strength = p.noise_strength
     noise_filter = f"noise=alls={noise_strength}:allf={p.noise_flags},"
-    vignette_filter = "" if fast_mac else f"vignette=PI/5*{p.vignette_angle}"
-    if fast_mac:
-        # Keep the filter graph valid after trailing commas are composed.
-        vignette_filter = "null"
+    vignette_filter = f"vignette=PI/5*{p.vignette_angle}"
 
     # Optimized blur: downscale -> blur -> upscale (4x cheaper than full-res blur)
     bg_w, bg_h = tw // 4, th // 4

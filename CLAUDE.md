@@ -46,7 +46,18 @@ Build the `.app`:
 ./build.sh share    # bundle + codesign verify + smoke launch + DMG + sha256 + release notes
 ```
 
-There is no unit-test suite or linter. `verify_quality.py` is the correctness gate.
+Test suite (pytest, headless Qt; ~5 s). Tests needing ffmpeg are marked `ffmpeg` and skip without it:
+```bash
+pip3 install -r requirements-dev.txt
+python3 -m pytest
+UPDATE_GOLDEN=1 python3 -m pytest tests/test_pure.py   # after an intended filter-graph change
+```
+- `tests/test_pure.py` — geometry invariants, sizing, naming, and `tests/golden/video_graph.txt`: a seeded snapshot of the video/audio filter graphs. That snapshot is the "video graph is byte-identical" check the `build_spatial_chain` note below asks for; regenerate it only for an intended change, and review the diff.
+- `tests/test_engine_ffmpeg.py` — watchdog (cancel/stall), disk-full, dyld-dead ffmpeg (via scripted stand-in binaries), per-file callbacks, Match Source.
+- `tests/test_ui.py` — defaults, persistence and clamping, presets, folder scan filters, a real batch with statuses and Retry, quit mid-batch.
+- Every test gets its own QSettings INI (`conftest.isolated_settings`); never point tests at the real preferences.
+
+CI (`.github/workflows/ci.yml`, macOS arm64) runs pytest plus both quality gates on every push and PR; a `v*` tag also runs `./build.sh share` and uploads the DMG as an artifact. `verify_quality.py` remains the perceptual correctness gate; there is no linter.
 
 ## Architecture
 

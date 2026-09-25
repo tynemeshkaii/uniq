@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests and quality gate
+    # Apple Silicon, like the testers' Macs. The engine shells out to ffmpeg,
+    # and the gate measures real encodes, so this has to be macOS.
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Unit and UI tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -ra
+
+      # CLAUDE.md: the gate must pass after any engine change. It exits
+      # non-zero on any failed check.
+      - name: Quality gate (video)
+        run: python src/verify_quality.py
+
+      - name: Quality gate (image)
+        run: |
+          ffmpeg -loglevel error -y -f lavfi -i testsrc2=s=1600x1200 -frames:v 1 "$RUNNER_TEMP/photo.jpg"
+          python src/verify_quality.py "$RUNNER_TEMP/photo.jpg"
+
+  build:
+    name: Build tester DMG
+    needs: test
+    # Only for release tags and manual runs: a build takes several minutes of
+    # macOS runner time and the tests already cover the code.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # build number = commit count
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # build.sh bundles the Homebrew ffmpeg with its libraries, verifies the
+      # app is self-contained, smoke-launches it and makes the DMG. It refuses
+      # a dirty tree, which a fresh checkout never is.
+      - name: Build
+        run: ./build.sh share
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-uniqualizer-${{ github.ref_name }}
+          path: |
+            dist/Video Uniqualizer.dmg
+            dist/Video Uniqualizer.dmg.sha256
+            dist/RELEASE_NOTES.txt
+            dist/TESTING_ON_MAC.md
+          if-no-files-found: error

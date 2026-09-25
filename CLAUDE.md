@@ -55,6 +55,7 @@ Source layers under `src/`:
 - **`image_engine.py`** — the still pipeline. Reuses `engine.plan_geometry` and `engine.build_spatial_chain` rather than owning a second copy of the filter graph.
 - **`exif.py`** — EXIF APP1 and PNG `tEXt` writer, by hand, no piexif. ffmpeg's mjpeg encoder discards `-metadata`, so the camera identity is a post-encode pass.
 - **`main.py`** — PyQt6 GUI + `ProcessWorker(QThread)`. The only place engine work is invoked off the UI thread.
+- **`settings_store.py`** — QSettings persistence and named presets. Reads state generically off `ParamsPanel`'s attributes (every spin/check/combo, by attribute name), so a new control is persisted with no extra code, and restores through the widgets' setters, so saved values are clamped to the current safety caps. Bump `SCHEMA_VERSION` if a saved value would change meaning.
 - **`fingerprint.py`** — pHash and Haitsma-Kalker audio fingerprints, pure Python, no numpy. Dev-time only; nothing in `main.py` imports it, so it stays out of the bundle.
 - **`styles.py` / `icons.py` / `gen_icns.py`** — skeuomorphic stylesheet, programmatically drawn Qt icons, and the macOS `.icns` generator (build-time).
 
@@ -63,6 +64,8 @@ Source layers under `src/`:
 - **`RandomRanges`** is the spec the UI owns: min/max per effect plus feature toggles. Built by `ParamsPanel.build_ranges()`.
 - **`process_batch`** draws a **fresh `UniqueParams` per input file** from the ranges, copying only output-container settings (resolution, CRF, preset, encoder, overlay) from the UI template. So anything randomized varies per file, not per batch.
 - **`plan_geometry(src_w, src_h, p)`** resolves rotation safety margin, micro-crop, zoom, and pan into a single crop rectangle in Python, emitting literal **even** numbers into the filter graph.
+- **A 0×0 target means "match source".** `process_single_video` resolves it per file after probing via `match_source_size` (source aspect, long side capped at `MATCH_SOURCE_MAX_LONG_SIDE`, never upscaled), before `plan_geometry` runs. It is the UI default; the fixed presets (9:16, 4:5, 1:1, 16:9) fill any aspect mismatch with the blurred backdrop.
+- **Per-file reporting.** Both batch functions take `started_callback(path)` and `result_callback(path, ok, error)`, keyed by full path, not basename; `process_batch` also takes `overall_progress_callback`, which counts partial progress of files in flight. The UI's list statuses, Retry Failed and the ETA are built on these.
 - **`_STATIC_FIELDS`** is the explicit list that decides copied-vs-randomized. A new `UniqueParams` field is randomized per file *unless* you add it there — so any new output-container setting must be added to that list or it will silently vary per file.
 - **`build_video_chain` / `build_audio_chain`** are pure functions of `UniqueParams` + `GeometryPlan`. That purity is what lets `verify_quality.py` exercise the filter chain without encoding.
 - **`process_batch` is concurrent.** A `ThreadPoolExecutor` runs `default_worker_count()` files at once (cores/4, clamped 1-3, since x264 does not scale past a few cores), and splits x264 threads across jobs. Progress callbacks are the mean across active jobs, so per-file progress is not monotonic. Shared counters are under `state_lock`; keep new batch state there.

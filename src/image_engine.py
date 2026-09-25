@@ -698,6 +698,8 @@ def process_image_batch(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     cancelled: Optional[Callable[[], bool]] = None,
     max_workers: Optional[int] = None,
+    started_callback: Optional[Callable[[str], None]] = None,
+    result_callback: Optional[Callable[[str, bool, str], None]] = None,
 ) -> Tuple[int, List[str]]:
     """Process a batch of images concurrently.
 
@@ -705,6 +707,8 @@ def process_image_batch(
     output-container settings copied from the template.
 
     progress_callback(completed_count, total, filename)
+    started_callback(path) / result_callback(path, ok, error) — as in
+        ``engine.process_batch``
     """
     os.makedirs(output_folder, exist_ok=True)
 
@@ -744,6 +748,8 @@ def process_image_batch(
                 completed += 1
                 done = completed
                 errors.append(f"{fname}: unexpected error: {exc}")
+            if result_callback:
+                result_callback(fpath, False, f"unexpected error: {exc}")
             if progress_callback:
                 progress_callback(done, total, fname)
 
@@ -758,6 +764,8 @@ def process_image_batch(
                 not_started.append(fname)
             return
 
+        if started_callback:
+            started_callback(fpath)
         params = ImageParams.generate_random(ranges)
         if params_template:
             for field_name in _STATIC_IMAGE_FIELDS:
@@ -782,6 +790,8 @@ def process_image_batch(
             log.warning("image failed: %s: %s", fpath, err)
             if err.startswith(DISK_FULL_ERROR):
                 disk_full.set()
+        if result_callback:
+            result_callback(fpath, ok, "" if ok else (err or "failed"))
 
         if progress_callback:
             progress_callback(done, total, fname)

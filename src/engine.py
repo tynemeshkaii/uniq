@@ -142,6 +142,10 @@ GPS_LOCATIONS = [
 
 TARGET_WIDTH = 1080
 TARGET_HEIGHT = 1920
+# A target of 0x0 means "match the source": keep its aspect, and scale the long
+# side down to this cap (never up). 1920 is what Meta and most social
+# placements deliver at; anything above it is downscaled on upload anyway.
+MATCH_SOURCE_MAX_LONG_SIDE = 1920
 
 _OUT_TIME_RE = re.compile(r"(\d+):(\d+):(\d+)\.(\d+)")
 # A slow encode is not a hung one, so the hard ceiling scales with the clip
@@ -1106,6 +1110,23 @@ def _perspective_corners(quad: List[Tuple[float, float]],
     )
 
 
+def match_source_size(src_w: int, src_h: int,
+                      max_long_side: int = MATCH_SOURCE_MAX_LONG_SIDE) -> Tuple[int, int]:
+    """Output size that keeps the source aspect, capped, never upscaled.
+
+    Only the long side is rounded and the short side is derived from it, the
+    same rule as ``image_engine.plan_image_canvas``: rounding both drifts the
+    aspect, and plan_geometry would then crop to correct the drift.
+    """
+    long_side = max(src_w, src_h)
+    scale = min(1.0, max_long_side / long_side) if max_long_side else 1.0
+    if src_w >= src_h:
+        out_w = _even(round(src_w * scale))
+        return out_w, _even(round(out_w * src_h / src_w))
+    out_h = _even(round(src_h * scale))
+    return _even(round(out_h * src_w / src_h)), out_h
+
+
 def plan_geometry(src_w: int, src_h: int, p: UniqueParams) -> GeometryPlan:
     """Resolve rotation safety margin, micro-crop, zoom and pan into one crop."""
     target_w, target_h = p.target_width, p.target_height
@@ -1588,6 +1609,9 @@ def process_single_video(
     if not info.has_geometry:
         return False, "could not read video dimensions (unsupported or corrupt file)"
 
+    if p.target_width <= 0 or p.target_height <= 0:
+        p.target_width, p.target_height = match_source_size(info.width, info.height)
+
     duration = info.duration
     if duration and (p.trim_start + p.trim_end) >= duration * 0.4:
         p.trim_start = 0.1
@@ -1878,6 +1902,9 @@ def process_batch(
     file_progress_callback: Optional[Callable[[float], None]] = None,
     cancelled: Optional[Callable[[], bool]] = None,
     max_workers: Optional[int] = None,
+    started_callback: Optional[Callable[[str], None]] = None,
+    result_callback: Optional[Callable[[str, bool, str], None]] = None,
+    overall_progress_callback: Optional[Callable[[float], None]] = None,
 ) -> Tuple[int, List[str]]:
     """
     Process a batch of video files, several at a time.
@@ -1885,6 +1912,12 @@ def process_batch(
 
     progress_callback(completed_count, total, filename)
     file_progress_callback(fraction_0_to_1) — mean progress across active jobs
+    started_callback(path) — a file began encoding
+    result_callback(path, ok, error) — a file finished; error is "cancelled"
+        for a file stopped by Cancel, and "" on success. Keyed by full path,
+        since two inputs from different folders can share a basename.
+    overall_progress_callback(fraction_0_to_1) — the whole batch, counting
+        partial progress of the files in flight; this is what an ETA needs
     """
     os.makedirs(output_folder, exist_ok=True)
 
@@ -1915,12 +1948,22 @@ def process_batch(
     not_started: List[str] = []
 
     def _report_file_progress(job_id: int, fraction: float):
-        if not file_progress_callback:
-            return
         with state_lock:
             active_progress[job_id] = fraction
             mean = sum(active_progress.values()) / len(active_progress)
-        file_progress_callback(mean)
+            overall = (completed + sum(active_progress.values())) / total
+        if file_progress_callback:
+            file_progress_callback(mean)
+        if overall_progress_callback:
+            overall_progress_callback(min(overall, 1.0))
+
+    def _report_done(fpath: str, ok: bool, err: str):
+        with state_lock:
+            overall = (completed + sum(active_progress.values())) / total
+        if result_callback:
+            result_callback(fpath, ok, err)
+        if overall_progress_callback:
+            overall_progress_callback(min(overall, 1.0))
 
     def _run(job: Tuple[int, str]):
         """Never raises.
@@ -1941,6 +1984,7 @@ def process_batch(
                 done = completed
                 active_progress.pop(job_id, None)
                 errors.append(f"{fname}: unexpected error: {exc}")
+            _report_done(fpath, False, f"unexpected error: {exc}")
             if progress_callback:
                 progress_callback(done, total, fname)
 
@@ -1957,6 +2001,8 @@ def process_batch(
 
         with state_lock:
             active_progress[job_id] = 0.0
+        if started_callback:
+            started_callback(fpath)
 
         if randomize_each:
             params = UniqueParams.generate_random(ranges)
@@ -1989,6 +2035,7 @@ def process_batch(
             log.warning("video failed: %s: %s", fpath, err)
             if err.startswith(DISK_FULL_ERROR):
                 disk_full.set()
+        _report_done(fpath, ok, "" if ok else (err or "failed"))
 
         if progress_callback:
             progress_callback(done, total, fname)

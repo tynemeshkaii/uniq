@@ -8,21 +8,23 @@ import os
 import logging
 import shutil
 import subprocess
+import time
 import traceback
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QFileDialog,
     QProgressBar, QGroupBox, QDoubleSpinBox, QSpinBox, QCheckBox,
     QComboBox, QTabWidget, QScrollArea, QFrame, QSizePolicy,
-    QAbstractItemView, QGridLayout, QMessageBox
+    QAbstractItemView, QGridLayout, QMessageBox, QInputDialog
 )
 from PyQt6.QtCore import Qt, QThread, QObject, QTimer, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, QUrl, QMimeData
-from PyQt6.QtGui import QAction, QCloseEvent, QIcon, QFont, QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import QAction, QCloseEvent, QColor, QIcon, QFont, QDragEnterEvent, QDropEvent
 
 from engine import (
     ENCODER_H264_VIDEOTOOLBOX,
     ENCODER_LABELS,
     ENCODER_LIBX264,
+    MATCH_SOURCE_MAX_LONG_SIDE,
     MAX_AUDIO_DELAY_MS,
     MAX_HUE_DEGREES,
     MAX_ROTATE_DEGREES,
@@ -42,6 +44,7 @@ from engine import (
     default_worker_count,
     ffmpeg_version_line,
     get_ffmpeg_path,
+    probe_file,
     process_batch,
 )
 from image_engine import (
@@ -66,6 +69,7 @@ from icons import (
 )
 from styles import MAIN_STYLESHEET
 import applog
+import settings_store
 from version import DISPLAY_VERSION
 
 log = logging.getLogger("app")
@@ -75,6 +79,17 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
 # image pipeline produces a message naming the format, whereas silently
 # ignoring the drop looks like the app is broken.
 MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS | UNSUPPORTED_IMAGE_EXTENSIONS
+
+
+# (key, label, width, height). "match" resolves per file in the engine.
+OUTPUT_SIZE_PRESETS = [
+    ("match", f"Match Source (≤ {MATCH_SOURCE_MAX_LONG_SIDE} px)", 0, 0),
+    ("9x16", "9:16 Vertical — 1080×1920", 1080, 1920),
+    ("4x5", "4:5 Portrait — 1080×1350", 1080, 1350),
+    ("1x1", "1:1 Square — 1080×1080", 1080, 1080),
+    ("16x9", "16:9 Landscape — 1920×1080", 1920, 1080),
+    ("custom", "Custom…", 0, 0),
+]
 
 
 def _is_still(path: str) -> bool:
@@ -207,11 +222,19 @@ def _install_exception_hook():
 
 class ProcessWorker(QThread):
     progress = pyqtSignal(int, int, str)   # completed, total, filename
-    file_progress = pyqtSignal(float)      # 0.0–1.0, mean across active jobs
+    # Whole-batch fraction 0.0–1.0, including files in flight; drives the bar
+    # and the ETA. Weighted so a still counts for a small fraction of a video
+    # (see _IMAGE_WEIGHT), otherwise a mixed batch races to "90%" on its
+    # stills and then sits there for the whole video phase.
+    overall_progress = pyqtSignal(float)
+    file_started = pyqtSignal(str)             # full path
+    file_result = pyqtSignal(str, bool, str)   # full path, ok, error
     # Deliberately not named `finished` — that would shadow QThread.finished,
     # which Qt uses internally for thread teardown.
     job_finished = pyqtSignal(int, bool, list)  # success_count, was_cancelled, errors
     error = pyqtSignal(str)
+
+    _IMAGE_WEIGHT = 0.05
 
     def __init__(self, files, output_folder, params, ranges, workers=0,
                  image_params=None, image_ranges=None, parent=None):
@@ -247,26 +270,33 @@ class ProcessWorker(QThread):
         total = len(self.files)
         errors = []
         count = 0
+        image_units = len(images) * self._IMAGE_WEIGHT
+        all_units = (image_units + len(videos)) or 1.0
         log.info("batch start: %d videos, %d images -> %s (workers=%s, "
-                 "encoder=%s, profile=%s, preset=%s, crf=%s, %dx%d)",
+                 "encoder=%s, profile=%s, preset=%s, crf=%s, %s)",
                  len(videos), len(images), self.output_folder, self.workers,
                  self.params.encoder, self.params.performance_profile,
                  self.params.preset, self.params.crf,
-                 self.params.target_width, self.params.target_height)
+                 f"{self.params.target_width}x{self.params.target_height}"
+                 if self.params.target_width else "match source")
 
         try:
             if images:
+                def _image_progress(cur, tot, fn):
+                    self.progress.emit(cur, total, fn)
+                    done = cur / tot if tot else 1.0
+                    self.overall_progress.emit(done * image_units / all_units)
+
                 done_images, image_errors = process_image_batch(
                     input_files=images,
                     output_folder=self.output_folder,
                     params_template=self.image_params,
                     ranges=self.image_ranges,
-                    progress_callback=lambda cur, tot, fn: (
-                        self.progress.emit(cur, total, fn),
-                        self.file_progress.emit(cur / tot if tot else 1.0),
-                    ),
+                    progress_callback=_image_progress,
                     cancelled=self.is_cancelled,
                     max_workers=image_workers_for(self.workers),
+                    started_callback=self.file_started.emit,
+                    result_callback=self.file_result.emit,
                 )
                 count += done_images
                 errors += image_errors
@@ -281,9 +311,12 @@ class ProcessWorker(QThread):
                     randomize_each=True,
                     progress_callback=lambda cur, tot, fn: self.progress.emit(
                         offset + cur, total, fn),
-                    file_progress_callback=lambda pct: self.file_progress.emit(pct),
                     cancelled=self.is_cancelled,
                     max_workers=self.workers,
+                    started_callback=self.file_started.emit,
+                    result_callback=self.file_result.emit,
+                    overall_progress_callback=lambda f: self.overall_progress.emit(
+                        (image_units + f * len(videos)) / all_units),
                 )
                 count += done_videos
                 errors += video_errors
@@ -396,14 +429,125 @@ class ParamsPanel(QWidget):
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(10)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._build_geometry_tab(), "Geometry")
-        tabs.addTab(self._build_color_tab(), "Color")
-        tabs.addTab(self._build_effects_tab(), "Effects")
-        tabs.addTab(self._build_images_tab(), "Images")
-        tabs.addTab(self._build_output_tab(), "Output")
-        main_layout.addWidget(tabs)
+        # The essentials stay visible; the ~45 tuning controls sit behind
+        # "Advanced settings", off by default. The defaults are the measured
+        # safe operating point, so most batches never need the tabs.
+        main_layout.addLayout(self._build_quick_row())
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_geometry_tab(), "Geometry")
+        self.tabs.addTab(self._build_color_tab(), "Color")
+        self.tabs.addTab(self._build_effects_tab(), "Effects")
+        self.tabs.addTab(self._build_images_tab(), "Images")
+        self.tabs.addTab(self._build_output_tab(), "Output")
+        main_layout.addWidget(self.tabs)
+
+        self.chk_advanced.toggled.connect(self.tabs.setVisible)
+        self.tabs.setVisible(False)
+
+    def _build_quick_row(self):
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+
+        size_hint = ("Video output frame. Match Source keeps each video's own "
+                     f"aspect ratio and caps the long side at "
+                     f"{MATCH_SOURCE_MAX_LONG_SIDE} px (never upscales). A fixed "
+                     "size that differs from a source's aspect fills the rest "
+                     "with a blurred backdrop.\n\nImages always keep their own "
+                     "aspect ratio; see the Images tab.")
+        lbl = QLabel("Video Size:")
+        lbl.setToolTip(size_hint)
+        self.combo_size = QComboBox()
+        self.combo_size.setToolTip(size_hint)
+        for key, label, _w, _h in OUTPUT_SIZE_PRESETS:
+            self.combo_size.addItem(label, key)
+        self.combo_size.currentIndexChanged.connect(self._sync_size_controls)
+        grid.addWidget(lbl, 0, 0)
+        grid.addWidget(self.combo_size, 0, 1)
+
+        self.spin_width = QSpinBox()
+        self.spin_width.setRange(320, 7680)
+        self.spin_width.setSingleStep(2)
+        self.spin_width.setPrefix("W ")
+        self.spin_height = QSpinBox()
+        self.spin_height.setRange(320, 7680)
+        self.spin_height.setSingleStep(2)
+        self.spin_height.setPrefix("H ")
+        size_row = QHBoxLayout()
+        size_row.addWidget(self.spin_width)
+        size_row.addWidget(self.spin_height)
+        grid.addLayout(size_row, 0, 2)
+
+        lbl = QLabel("Speed Profile:")
+        self.combo_performance = QComboBox()
+        for key, label in PERFORMANCE_PROFILE_LABELS.items():
+            self.combo_performance.addItem(label, key)
+        profile_hint = (
+            "Sets the encoder, preset and hardware bitrate on the Output tab. "
+            "The filter chain is the same in every profile.\n\n"
+            "Max Quality: libx264, slow preset.\n"
+            "Balanced: libx264, fast preset.\n"
+            "Fast Mac: VideoToolbox hardware encoder where available.")
+        lbl.setToolTip(profile_hint)
+        self.combo_performance.setToolTip(profile_hint)
+        grid.addWidget(lbl, 1, 0)
+        grid.addWidget(self.combo_performance, 1, 1)
+
+        self.chk_advanced = QCheckBox("Advanced settings")
+        self.chk_advanced.setToolTip(
+            "Show every tuning control. The defaults are the measured safe "
+            "operating point; Reset Defaults returns to it.")
+        grid.addWidget(self.chk_advanced, 1, 2)
+        grid.setColumnStretch(1, 1)
+        return grid
+
+    def _sync_size_controls(self):
+        key = self.combo_size.currentData()
+        custom = key == "custom"
+        self.spin_width.setVisible(custom)
+        self.spin_height.setVisible(custom)
+        for k, _label, w, h in OUTPUT_SIZE_PRESETS:
+            if k == key and w:
+                self.spin_width.setValue(w)
+                self.spin_height.setValue(h)
+
+    def target_size(self) -> tuple:
+        """(width, height) for the video template; (0, 0) means match source."""
+        if self.combo_size.currentData() == "match":
+            return 0, 0
+        # libx264 with yuv420p rejects odd dimensions.
+        return self.spin_width.value() // 2 * 2, self.spin_height.value() // 2 * 2
+
+    def get_state(self) -> dict:
+        state = settings_store.widget_state(self)
+        # A view preference, not a processing setting: loading a preset must
+        # not expand or collapse the panel.
+        state.pop("chk_advanced", None)
+        state["overlay_file"] = self._overlay_file
+        return state
+
+    def set_state(self, state: dict):
+        """Apply saved state on top of the defaults.
+
+        The profile goes first with its signal blocked: its handler rewrites
+        encoder, preset and bitrate, and the saved values of those must win.
+        """
+        self.load_defaults()
+        self.combo_performance.blockSignals(True)
+        try:
+            settings_store.apply_widget_state(self, state, order=["combo_performance"])
+        finally:
+            self.combo_performance.blockSignals(False)
+        self._sync_size_controls()
+        self._sync_image_geometry_enabled()
+        overlay = state.get("overlay_file") or ""
+        if overlay and not os.path.isfile(overlay):
+            log.info("saved overlay %s no longer exists; cleared", overlay)
+            overlay = ""
+        self._set_overlay(overlay)
 
     def _build_geometry_tab(self):
         w = QWidget()
@@ -815,30 +959,12 @@ class ParamsPanel(QWidget):
         layout = QVBoxLayout(w)
         layout.setSpacing(8)
 
-        self.spin_width = QSpinBox()
-        self.spin_width.setRange(320, 7680)
-        self.spin_width.setSingleStep(10)
-        layout.addLayout(make_param_row("Target Width:", self.spin_width))
-
-        self.spin_height = QSpinBox()
-        self.spin_height.setRange(320, 7680)
-        self.spin_height.setSingleStep(10)
-        layout.addLayout(make_param_row("Target Height:", self.spin_height))
-
         self.spin_crf = QSpinBox()
         self.spin_crf.setRange(0, 51)
         layout.addLayout(make_param_row("CRF (quality):", self.spin_crf, "0=lossless, 23=default, 51=worst"))
 
-        self.combo_performance = QComboBox()
-        for key, label in PERFORMANCE_PROFILE_LABELS.items():
-            self.combo_performance.addItem(label, key)
+        # The profile combo lives in the quick row; it drives these controls.
         self.combo_performance.currentIndexChanged.connect(self._apply_performance_profile)
-        layout.addLayout(make_param_row("macOS Profile:", self.combo_performance,
-            "Sets the encoder, preset and hardware bitrate below. The filter "
-            "chain is the same in every profile.\n\n"
-            "Max Quality: libx264, slow preset.\n"
-            "Balanced: libx264, fast preset.\n"
-            "Fast Mac: VideoToolbox hardware encoder where available."))
 
         self.combo_encoder = QComboBox()
         available = available_video_encoders()
@@ -927,15 +1053,25 @@ class ParamsPanel(QWidget):
             self, "Select Overlay Video", "",
             "Video Files (*.mp4 *.mov *.avi *.mkv);;All Files (*)"
         )
-        if path:
-            self._overlay_file = path
-            self.overlay_path_label.setText(os.path.basename(path))
-            self.overlay_path_label.setToolTip(path)
+        if not path:
+            return
+        # Probed now rather than at encode time: an unreadable overlay used to
+        # be skipped silently for every file in the batch.
+        if not probe_file(path).has_geometry:
+            QMessageBox.warning(
+                self, "Unusable Overlay",
+                f"{os.path.basename(path)} could not be read as a video, so it "
+                "cannot be used as an overlay.")
+            return
+        self._set_overlay(path)
 
     def _clear_overlay(self):
-        self._overlay_file = ""
-        self.overlay_path_label.setText("No overlay selected")
-        self.overlay_path_label.setToolTip("")
+        self._set_overlay("")
+
+    def _set_overlay(self, path: str):
+        self._overlay_file = path
+        self.overlay_path_label.setText(os.path.basename(path) if path else "No overlay selected")
+        self.overlay_path_label.setToolTip(path)
 
     def load_defaults(self):
         """Load the perceptually safe operating point (see RandomRanges)."""
@@ -973,6 +1109,8 @@ class ParamsPanel(QWidget):
         self.spin_adelay_min.setValue(d.adelay_ms[0])
         self.spin_adelay_max.setValue(d.adelay_ms[1])
 
+        self.combo_size.setCurrentIndex(self.combo_size.findData("match"))
+        self._sync_size_controls()
         self.spin_width.setValue(1080)
         self.spin_height.setValue(1920)
         self.spin_crf.setValue(24)
@@ -1006,8 +1144,7 @@ class ParamsPanel(QWidget):
 
         self.spin_ov_opacity_min.setValue(d.ov_opacity[0])
         self.spin_ov_opacity_max.setValue(d.ov_opacity[1])
-        self._overlay_file = ""
-        self.overlay_path_label.setText("No overlay selected")
+        self._set_overlay("")
 
         di = ImageRanges()
         self.chk_img_full_frame.setChecked(di.preserve_full_frame)
@@ -1113,8 +1250,7 @@ class ParamsPanel(QWidget):
         """Build the static template: output settings that must not be randomized."""
         p = UniqueParams()
         p.overlay_file = self._overlay_file
-        p.target_width = self.spin_width.value()
-        p.target_height = self.spin_height.value()
+        p.target_width, p.target_height = self.target_size()
         p.crf = self.spin_crf.value()
         p.preset = self.combo_preset.currentText()
         p.performance_profile = self.combo_performance.currentData() or PERFORMANCE_PROFILE_BALANCED
@@ -1196,8 +1332,13 @@ class MainWindow(QMainWindow):
         # Set when the user quits mid-batch: the window closes itself once the
         # worker has stopped, and the end-of-batch dialogs are skipped.
         self._quit_after_worker = False
-        self._current_file_index = 0
-        self._current_file_total = 0
+        # Per-batch bookkeeping for the list statuses, the progress text and
+        # the ETA.
+        self._batch_files = []
+        self._results = {}          # path -> (ok, error)
+        self._active = []           # paths currently encoding, in start order
+        self._done_count = 0
+        self._batch_started = 0.0
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1229,8 +1370,9 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         root.addWidget(scroll, 1)
 
-        self._update_button_states()
         self._build_menu()
+        self._restore_settings()
+        self._update_button_states()
 
     def _build_menu(self):
         help_menu = self.menuBar().addMenu("Help")
@@ -1308,6 +1450,7 @@ class MainWindow(QMainWindow):
             self.scanner.wait()
             self.scanner = None
         if self.worker is None or not self.worker.isRunning():
+            self._save_settings()
             event.accept()
             return
         event.ignore()
@@ -1357,7 +1500,21 @@ class MainWindow(QMainWindow):
         lay.addLayout(titles)
         lay.addStretch()
 
-        # Reset params button
+        # Presets: named snapshots of every parameter, kept in QSettings.
+        self.combo_presets = QComboBox()
+        self.combo_presets.setMinimumWidth(160)
+        self.combo_presets.setToolTip("Load a saved set of parameters")
+        self.combo_presets.activated.connect(self._load_selected_preset)
+        lay.addWidget(self.combo_presets)
+
+        btn_save_preset = QPushButton("Save Preset…")
+        btn_save_preset.clicked.connect(self._save_preset)
+        lay.addWidget(btn_save_preset)
+
+        self.btn_delete_preset = QPushButton("Delete")
+        self.btn_delete_preset.clicked.connect(self._delete_preset)
+        lay.addWidget(self.btn_delete_preset)
+
         btn_reset = QPushButton("Reset Defaults")
         btn_reset.setIcon(settings_icon(32))
         btn_reset.clicked.connect(self._reset_params)
@@ -1390,6 +1547,9 @@ class MainWindow(QMainWindow):
         btn_clear = QPushButton("Clear All")
         btn_clear.clicked.connect(self._clear_files)
         input_header.addWidget(btn_clear)
+        # Locked while a batch runs: the status column is written back to these
+        # rows by path, and the worker holds its own copy of the list anyway.
+        self._list_edit_buttons = [btn_add, btn_remove, btn_clear]
 
         layout.addLayout(input_header)
 
@@ -1425,6 +1585,10 @@ class MainWindow(QMainWindow):
         output_header.addWidget(lbl2)
         output_header.addStretch()
 
+        self.btn_show_output = QPushButton("Show in Finder")
+        self.btn_show_output.clicked.connect(self._show_output_folder)
+        output_header.addWidget(self.btn_show_output)
+
         btn_output = QPushButton("  Select Folder")
         btn_output.setIcon(output_folder_icon(32))
         btn_output.setIconSize(QSize(24, 24))
@@ -1449,25 +1613,18 @@ class MainWindow(QMainWindow):
     def _build_action_section(self) -> QWidget:
         card, layout = make_panel()
 
-        # Overall progress
+        # One bar for the whole batch. It counts the partial progress of files
+        # in flight, so it moves during a long encode, and it feeds the ETA.
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Ready")
         self.progress_bar.setFixedHeight(28)
         layout.addWidget(self.progress_bar)
 
-        # Per-file progress
-        self.file_progress_bar = QProgressBar()
-        self.file_progress_bar.setRange(0, 1000)
-        self.file_progress_bar.setValue(0)
-        self.file_progress_bar.setFormat("")
-        self.file_progress_bar.setFixedHeight(16)
-        self.file_progress_bar.setVisible(False)
-        layout.addWidget(self.file_progress_bar)
-
         self.status_label = QLabel("")
         self.status_label.setObjectName("statusLabel")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
         # Buttons row
@@ -1478,8 +1635,14 @@ class MainWindow(QMainWindow):
         self.btn_process.setObjectName("btnProcess")
         self.btn_process.setIcon(process_icon(48))
         self.btn_process.setIconSize(QSize(28, 28))
-        self.btn_process.clicked.connect(self._start_processing)
+        self.btn_process.clicked.connect(lambda: self._start_processing())
         btn_row.addWidget(self.btn_process)
+
+        self.btn_retry = QPushButton("Retry Failed")
+        self.btn_retry.setToolTip("Process again only the files marked ✗")
+        self.btn_retry.setVisible(False)
+        self.btn_retry.clicked.connect(self._retry_failed)
+        btn_row.addWidget(self.btn_retry)
 
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setObjectName("btnCancel")
@@ -1491,6 +1654,130 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         return card
+
+    # ─── Settings & presets ──────────────────────────────
+
+    def _restore_settings(self):
+        s = settings_store.settings()
+        geometry = s.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        folder = s.value("output_folder", "", type=str)
+        if folder and os.path.isdir(folder):
+            self.output_folder = folder
+            self.output_label.setToolTip(folder)
+            self._refresh_output_label()
+        state = settings_store.load_last_state()
+        if state:
+            self.params_panel.set_state(state)
+        self.params_panel.chk_advanced.setChecked(s.value("advanced", False, type=bool))
+        self._refresh_presets()
+
+    def _save_settings(self):
+        s = settings_store.settings()
+        s.setValue("window/geometry", self.saveGeometry())
+        s.setValue("output_folder", self.output_folder)
+        s.setValue("advanced", self.params_panel.chk_advanced.isChecked())
+        settings_store.save_last_state(self.params_panel.get_state())
+        s.sync()
+
+    def _refresh_presets(self, select: str = ""):
+        self.combo_presets.blockSignals(True)
+        self.combo_presets.clear()
+        self.combo_presets.addItem("Presets", None)
+        for name in settings_store.list_presets():
+            self.combo_presets.addItem(name, name)
+        idx = self.combo_presets.findData(select) if select else 0
+        self.combo_presets.setCurrentIndex(max(idx, 0))
+        self.combo_presets.blockSignals(False)
+        self.btn_delete_preset.setEnabled(bool(select))
+
+    def _load_selected_preset(self):
+        name = self.combo_presets.currentData()
+        self.btn_delete_preset.setEnabled(bool(name))
+        if not name:
+            return
+        state = settings_store.load_preset(name)
+        if state is None:
+            QMessageBox.warning(
+                self, "Preset Unavailable",
+                f"“{name}” was saved by an incompatible version and cannot be loaded.")
+            return
+        self.params_panel.set_state(state)
+        self.status_label.setText(f"Loaded preset “{name}”.")
+        log.info("loaded preset %r", name)
+
+    def _save_preset(self):
+        current = self.combo_presets.currentData() or ""
+        name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:", text=current)
+        name = name.strip()
+        if not ok or not name:
+            return
+        # QSettings treats slashes as key separators.
+        if "/" in name or "\\" in name:
+            QMessageBox.warning(self, "Invalid Name", "Preset names cannot contain / or \\.")
+            return
+        if name in settings_store.list_presets():
+            answer = QMessageBox.question(
+                self, "Replace Preset?", f"A preset named “{name}” exists. Replace it?",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Cancel)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        settings_store.save_preset(name, self.params_panel.get_state())
+        self._refresh_presets(select=name)
+        self.status_label.setText(f"Saved preset “{name}”.")
+        log.info("saved preset %r", name)
+
+    def _delete_preset(self):
+        name = self.combo_presets.currentData()
+        if not name:
+            return
+        answer = QMessageBox.question(
+            self, "Delete Preset?", f"Delete the preset “{name}”?",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        settings_store.delete_preset(name)
+        self._refresh_presets()
+        log.info("deleted preset %r", name)
+
+    # ─── Per-file status ─────────────────────────────────
+
+    _STATUS_ROLE = Qt.ItemDataRole.UserRole + 1
+    _STATUS_STYLE = {
+        # status: (prefix, colour or None)
+        "pending": ("", None),
+        # Picked for contrast on the dark list background.
+        "running": ("▶ ", "#6FA8DC"),
+        "ok": ("✓ ", "#5BC47A"),
+        "failed": ("✗ ", "#E5605A"),
+        "skipped": ("– ", "#8A8A96"),
+    }
+
+    def _items_by_path(self) -> dict:
+        return {self.file_list.item(r).data(Qt.ItemDataRole.UserRole): self.file_list.item(r)
+                for r in range(self.file_list.count())}
+
+    def _set_status(self, item, status: str, detail: str = ""):
+        if item is None:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        prefix, colour = self._STATUS_STYLE[status]
+        item.setData(self._STATUS_ROLE, status)
+        item.setText(prefix + os.path.basename(path))
+        # None clears the override, so a pending row goes back to the style's colour.
+        item.setData(Qt.ItemDataRole.ForegroundRole, QColor(colour) if colour else None)
+        item.setToolTip(f"{path}\n{detail}" if detail else path)
+
+    def _failed_paths(self) -> list:
+        return [p for p, item in self._items_by_path().items()
+                if item.data(self._STATUS_ROLE) == "failed"]
+
+    def _show_output_folder(self):
+        if self.output_folder and os.path.isdir(self.output_folder):
+            subprocess.run(["open", self.output_folder], check=False)
 
     # ─── Slots ───────────────────────────────────────────
 
@@ -1529,6 +1816,17 @@ class MainWindow(QMainWindow):
         rather than processed twice.
         """
         existing = {os.path.realpath(f) for f in self.input_files}
+        # Each addItem fires rowsInserted, which would rebuild input_files and
+        # the button states once per row: quadratic, and seconds of frozen UI
+        # for a 2000-file folder. One sync at the end is enough.
+        self._bulk_adding = True
+        try:
+            self._add_items(paths, existing)
+        finally:
+            self._bulk_adding = False
+        self._sync_files_from_list()
+
+    def _add_items(self, paths: list, existing: set):
         for p in paths:
             if not _is_candidate(p):
                 continue
@@ -1543,10 +1841,11 @@ class MainWindow(QMainWindow):
             # telling `input_files` about it.
             item.setData(Qt.ItemDataRole.UserRole, p)
             self.file_list.addItem(item)
-        self._sync_files_from_list()
 
     def _sync_files_from_list(self):
         """Rebuild ``input_files`` from the widget — the widget is the truth."""
+        if getattr(self, "_bulk_adding", False):
+            return
         paths = []
         for row in range(self.file_list.count()):
             item = self.file_list.item(row)
@@ -1604,6 +1903,7 @@ class MainWindow(QMainWindow):
 
     def _reset_params(self):
         self.params_panel.load_defaults()
+        self._refresh_presets()
 
     def _update_file_count(self):
         n = len(self.input_files)
@@ -1623,9 +1923,14 @@ class MainWindow(QMainWindow):
                     f"{n} video{'s' if n != 1 else ''} selected")
 
     def _update_button_states(self):
+        running = self.worker is not None
         can_start = len(self.input_files) > 0 and bool(self.output_folder)
-        self.btn_process.setEnabled(
-            can_start and self.worker is None and self.scanner is None)
+        self.btn_process.setEnabled(can_start and not running and self.scanner is None)
+        for btn in getattr(self, "_list_edit_buttons", []):
+            btn.setEnabled(not running)
+        self.file_list.setAcceptDrops(not running)
+        self.btn_show_output.setEnabled(bool(self.output_folder) and os.path.isdir(self.output_folder))
+        self.btn_retry.setVisible(not running and bool(self._failed_paths()))
 
     def _cleanup_worker(self):
         """Safely wait for and discard worker thread."""
@@ -1669,7 +1974,7 @@ class MainWindow(QMainWindow):
         )
         return answer == QMessageBox.StandardButton.Yes
 
-    def _confirm_disk_space(self) -> bool:
+    def _confirm_disk_space(self, files) -> bool:
         """Check the output volume can plausibly hold the batch.
 
         The estimate is 1.5x the input size: a re-encode at the default CRF
@@ -1685,7 +1990,7 @@ class MainWindow(QMainWindow):
             log.warning("disk_usage failed for %s: %s", self.output_folder, exc)
             return True
         total_in = 0
-        for f in self.input_files:
+        for f in files:
             try:
                 total_in += os.path.getsize(f)
             except OSError:
@@ -1711,17 +2016,22 @@ class MainWindow(QMainWindow):
         )
         return answer == QMessageBox.StandardButton.Yes
 
-    def _start_processing(self):
-        if not self.input_files or not self.output_folder:
+    def _start_processing(self, files=None):
+        files = list(files if files is not None else self.input_files)
+        if not files or not self.output_folder:
             return
 
         if not self._confirm_output_folder():
             return
-        if not self._confirm_disk_space():
+        if not self._confirm_disk_space(files):
             return
+        if not self._confirm_overlay():
+            return
+        # Saved at start, not only on quit, so a crash mid-batch keeps them.
+        self._save_settings()
 
         self.worker = ProcessWorker(
-            files=list(self.input_files),
+            files=files,
             output_folder=self.output_folder,
             params=self.params_panel.build_params(),
             ranges=self.params_panel.build_ranges(),
@@ -1730,82 +2040,161 @@ class MainWindow(QMainWindow):
             image_ranges=self.params_panel.build_image_ranges(),
         )
         self.worker.progress.connect(self._on_progress)
-        self.worker.file_progress.connect(self._on_file_progress)
+        self.worker.overall_progress.connect(self._on_overall_progress)
+        self.worker.file_started.connect(self._on_file_started)
+        self.worker.file_result.connect(self._on_file_result)
         self.worker.job_finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
 
-        self._current_file_index = 0
-        self._current_file_total = len(self.input_files)
+        self._batch_files = files
+        self._results = {}
+        self._active = []
+        self._done_count = 0
+        self._batch_started = time.monotonic()
+        items = self._items_by_path()
+        for path in files:
+            self._set_status(items.get(path), "pending")
 
         self.btn_process.setVisible(False)
         self.btn_cancel.setVisible(True)
         self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Starting...")
-        self.file_progress_bar.setValue(0)
-        self.file_progress_bar.setVisible(True)
+        self.progress_bar.setFormat(f"0/{len(files)} done")
+        self.status_label.setText("Starting…")
         self._update_button_states()
 
         self.worker.start()
 
+    def _confirm_overlay(self) -> bool:
+        overlay = self.params_panel._overlay_file
+        if not overlay or os.path.isfile(overlay):
+            return True
+        answer = QMessageBox.warning(
+            self, "Overlay Not Found",
+            f"The overlay video is gone:\n{overlay}\n\n"
+            "Process without an overlay?",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self.params_panel._clear_overlay()
+        return True
+
+    def _retry_failed(self):
+        failed = self._failed_paths()
+        if failed:
+            log.info("retrying %d failed files", len(failed))
+            self._start_processing(failed)
+
     def _cancel_processing(self):
         if self.worker:
             self.worker.cancel()
-            self.status_label.setText("Cancelling (waiting for ffmpeg to stop)...")
+            self.status_label.setText("Cancelling (waiting for ffmpeg to stop)…")
             self.btn_cancel.setEnabled(False)
 
     def _on_progress(self, completed, total, filename):
-        if total > 0:
-            pct = int((completed / total) * 100)
-            self.progress_bar.setValue(pct)
-            self.progress_bar.setFormat(f"{completed}/{total} done")
-            if filename:
-                self.status_label.setText(f"Finished: {filename}")
-            self._current_file_index = completed
+        self._done_count = completed
 
-    def _on_file_progress(self, fraction):
-        self.file_progress_bar.setValue(int(fraction * 1000))
-        pct = int(fraction * 100)
-        self.file_progress_bar.setFormat(f"Encoding: {pct}%")
+    def _on_overall_progress(self, fraction: float):
+        total = len(self._batch_files)
+        self.progress_bar.setValue(int(fraction * 1000))
+        text = f"{self._done_count}/{total} done · {int(fraction * 100)}%"
+        eta = self._eta_text(fraction)
+        self.progress_bar.setFormat(text + (f" · {eta}" if eta else ""))
 
-    def _on_finished(self, success_count, was_cancelled, errors):
-        total = len(self.input_files)
+    def _eta_text(self, fraction: float) -> str:
+        """Linear extrapolation from elapsed time; hidden until it means something.
+
+        Before ~3% or 5 seconds the estimate is dominated by startup (probing,
+        the first keyframes) and swings wildly, so nothing is shown.
+        """
+        elapsed = time.monotonic() - self._batch_started
+        if fraction < 0.03 or elapsed < 5 or fraction >= 1.0:
+            return ""
+        remaining = elapsed * (1.0 - fraction) / fraction
+        if remaining < 60:
+            return "less than a minute left"
+        if remaining < 3600:
+            return f"about {round(remaining / 60)} min left"
+        return f"about {remaining / 3600:.1f} h left"
+
+    def _on_file_started(self, path: str):
+        self._active.append(path)
+        self._set_status(self._items_by_path().get(path), "running")
+        self._show_active()
+
+    def _on_file_result(self, path: str, ok: bool, error: str):
+        if path in self._active:
+            self._active.remove(path)
+        self._results[path] = (ok, error)
+        item = self._items_by_path().get(path)
+        if ok:
+            self._set_status(item, "ok")
+        elif error == "cancelled":
+            self._set_status(item, "skipped", "Cancelled")
+        else:
+            self._set_status(item, "failed", error)
+        self._show_active()
+
+    def _show_active(self):
+        if not self._active:
+            return
+        names = [os.path.basename(p) for p in self._active]
+        shown = ", ".join(names[:3]) + (f" +{len(names) - 3} more" if len(names) > 3 else "")
+        self.status_label.setText(f"Processing: {shown}")
+
+    def _finish_batch_ui(self):
+        """Common teardown for a batch that ended, however it ended."""
+        items = self._items_by_path()
+        for path in self._batch_files:
+            if path not in self._results:
+                # Never started (cancelled, or the disk filled) or never reported.
+                self._set_status(items.get(path), "skipped", "Not processed")
+        self._active = []
         self.btn_process.setVisible(True)
         self.btn_cancel.setVisible(False)
         self.btn_cancel.setEnabled(True)
-        self.file_progress_bar.setVisible(False)
         self._cleanup_worker()
         self._update_button_states()
+
+    def _on_finished(self, success_count, was_cancelled, errors):
+        total = len(self._batch_files)
+        self._finish_batch_ui()
         if self._close_if_quitting():
             return
 
+        failed = sum(1 for ok, err in self._results.values() if not ok and err != "cancelled")
+        elapsed = time.monotonic() - self._batch_started
+        took = f"{elapsed:.0f} s" if elapsed < 90 else f"{elapsed / 60:.1f} min"
         if was_cancelled:
-            pct = int((success_count / total) * 100) if total > 0 else 0
-            self.progress_bar.setValue(pct)
+            self.progress_bar.setValue(int(success_count / total * 1000) if total else 0)
             self.progress_bar.setFormat(f"Cancelled — {success_count}/{total} processed")
             self.status_label.setText("")
-        else:
-            self.progress_bar.setValue(100)
-            self.progress_bar.setFormat(f"Done! {success_count}/{total} processed")
-            self.status_label.setText("")
+            return
 
-            msg = f"Successfully processed {success_count} of {total} files.\n\nOutput folder: {self.output_folder}"
-            if errors:
-                msg += f"\n\nErrors ({len(errors)}):\n" + "\n".join(errors[:10])
-                if len(errors) > 10:
-                    msg += f"\n... and {len(errors) - 10} more"
-                msg += "\n\nFull details are in the log (Help → Show Log in Finder)."
+        self.progress_bar.setValue(1000)
+        self.progress_bar.setFormat(f"Done — {success_count}/{total} processed in {took}")
+        self.status_label.setText(
+            f"{failed} file(s) failed — hover a ✗ row for the reason, or use Retry Failed."
+            if failed else "")
 
-            QMessageBox.information(self, "Processing Complete", msg)
+        msg = f"Processed {success_count} of {total} files in {took}."
+        if errors:
+            msg += f"\n\nErrors ({len(errors)}):\n" + "\n".join(errors[:10])
+            if len(errors) > 10:
+                msg += f"\n... and {len(errors) - 10} more"
+            msg += "\n\nFailed files are marked ✗ in the list. Full details are in the log (Help → Show Log in Finder)."
+        box = QMessageBox(QMessageBox.Icon.Information if not errors else QMessageBox.Icon.Warning,
+                          "Processing Complete", msg, parent=self)
+        show = box.addButton("Show in Finder", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is show:
+            self._show_output_folder()
 
     def _on_error(self, error_msg):
+        self._finish_batch_ui()
         self.progress_bar.setFormat("Error!")
         self.status_label.setText(f"Error: {error_msg}")
-        self.btn_process.setVisible(True)
-        self.btn_cancel.setVisible(False)
-        self.btn_cancel.setEnabled(True)
-        self.file_progress_bar.setVisible(False)
-        self._cleanup_worker()
-        self._update_button_states()
         if self._close_if_quitting():
             return
 

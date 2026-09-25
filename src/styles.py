@@ -193,6 +193,7 @@ QListWidget {
     border: 1px solid #3A3A45;
     border-top: 1px solid rgba(0, 0, 0, 40);
     border-radius: 8px;
+    color: #C8C8D4;
     padding: 4px;
     outline: none;
 }
@@ -201,7 +202,8 @@ QListWidget::item {
     padding: 6px 8px;
     border-radius: 6px;
     margin: 1px 2px;
-    color: #C8C8D4;
+    /* No `color` here: an item-level colour overrides the per-row status
+       colours set from code. The default text colour is on QListWidget. */
 }
 
 QListWidget::item:selected {

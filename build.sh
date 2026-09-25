@@ -97,6 +97,8 @@ binary_supports_host_arch() {
 
 ffmpeg_bin_is_self_contained() {
     [ -f "$FFMPEG_DIR/ffmpeg" ] && [ -f "$FFMPEG_DIR/ffprobe" ] || return 1
+    # Bundles made before license collection existed have to be redone.
+    [ -f "$FFMPEG_DIR/licenses/THIRD_PARTY_NOTICES.txt" ] || return 1
     python3 "$BUNDLE_TOOL" verify "$FFMPEG_DIR" --require-executables >/dev/null 2>&1
 }
 
@@ -124,7 +126,7 @@ bundle_ffmpeg_from_host() {
     fi
 
     echo "  Bundling $ffmpeg_path and its libraries..."
-    rm -rf "$FFMPEG_DIR/lib"
+    rm -rf "$FFMPEG_DIR/lib" "$FFMPEG_DIR/licenses"
     rm -f "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/ffprobe"
     python3 "$BUNDLE_TOOL" bundle --ffmpeg "$ffmpeg_path" --ffprobe "$ffprobe_path" --dest "$FFMPEG_DIR"
 }
@@ -335,6 +337,8 @@ check_bundled_ffmpeg() {
 
     python3 "$BUNDLE_TOOL" verify "$ffmpeg_root" --require-executables --boundary "$APP_DIR" \
         || fail "Bundled ffmpeg depends on libraries outside the app"
+    find "$APP_DIR" -path '*/licenses/THIRD_PARTY_NOTICES.txt' -type f | grep -q . \
+        || fail "Third-party license notices are missing from the app"
 
     local outside
     outside="$(DYLD_PRINT_LIBRARIES=1 "$ffmpeg_in_app" -hide_banner \

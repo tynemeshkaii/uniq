@@ -6,6 +6,7 @@ Main window with skeuomorphic design.
 import sys
 import os
 import logging
+import shutil
 import subprocess
 import traceback
 from PyQt6.QtWidgets import (
@@ -78,6 +79,83 @@ MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS | UNSUPPORTED_IMAGE_EXTEN
 
 def _is_still(path: str) -> bool:
     return is_image_file(path) or is_unsupported_image(path)
+
+
+# A dropped folder is walked off the GUI thread and capped: a home folder or a
+# photo library dropped by accident would otherwise freeze the window for
+# minutes and then fill the list with tens of thousands of rows.
+MAX_SCAN_FILES = 2000
+# Packages look like folders to os.walk but are single documents to the user;
+# a Photos library alone holds every original ever imported.
+_SKIP_DIR_SUFFIXES = (".app", ".photoslibrary", ".fcpbundle", ".imovielibrary",
+                      ".tvlibrary", ".musiclibrary")
+
+
+def _is_candidate(path: str) -> bool:
+    """A media file worth listing.
+
+    Names starting with a dot are skipped, and that includes the ``._name.mp4``
+    AppleDouble files macOS writes next to every file on exFAT/FAT drives: they
+    carry a media extension, hold only Finder metadata, and fail as a
+    "corrupt video" once for every real file on the card.
+    """
+    name = os.path.basename(path)
+    if name.startswith("."):
+        return False
+    return os.path.splitext(name)[1].lower() in MEDIA_EXTENSIONS
+
+
+def _format_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+class FolderScanWorker(QThread):
+    """Walks dropped folders for media files without blocking the window."""
+    scanned = pyqtSignal(list, bool)   # paths, truncated at MAX_SCAN_FILES
+
+    def __init__(self, folders, skip_dir="", parent=None):
+        super().__init__(parent)
+        self.folders = folders
+        # The output folder: its contents are this app's own results, and
+        # re-listing them re-processes the previous batch.
+        self.skip_dir = os.path.realpath(skip_dir) if skip_dir else ""
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        found, truncated = [], False
+        try:
+            for folder in self.folders:
+                for root, dirs, files in os.walk(folder):
+                    if self._cancelled:
+                        return
+                    dirs[:] = sorted(
+                        d for d in dirs
+                        if not d.startswith(".")
+                        and not d.lower().endswith(_SKIP_DIR_SUFFIXES)
+                        and os.path.realpath(os.path.join(root, d)) != self.skip_dir)
+                    for f in sorted(files):
+                        path = os.path.join(root, f)
+                        if _is_candidate(path):
+                            found.append(path)
+                            if len(found) >= MAX_SCAN_FILES:
+                                truncated = True
+                                break
+                    if truncated:
+                        break
+                if truncated:
+                    break
+        except Exception:
+            log.exception("folder scan failed")
+        log.info("folder scan: %d files%s from %s", len(found),
+                 " (truncated)" if truncated else "", self.folders)
+        self.scanned.emit(found, truncated)
 
 
 class _ErrorRelay(QObject):
@@ -224,6 +302,7 @@ class ProcessWorker(QThread):
 class MediaFileList(QListWidget):
     """QListWidget that accepts video and image drops from Finder."""
     files_dropped = pyqtSignal(list)
+    folders_dropped = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -246,23 +325,20 @@ class MediaFileList(QListWidget):
             super().dropEvent(event)
             return
 
-        paths = []
+        paths, folders = [], []
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if not path:
                 continue
             if os.path.isfile(path):
-                ext = os.path.splitext(path)[1].lower()
-                if ext in MEDIA_EXTENSIONS:
+                if _is_candidate(path):
                     paths.append(path)
             elif os.path.isdir(path):
-                for root, _, files in os.walk(path):
-                    for f in files:
-                        ext = os.path.splitext(f)[1].lower()
-                        if ext in MEDIA_EXTENSIONS:
-                            paths.append(os.path.join(root, f))
+                folders.append(path)
         if paths:
             self.files_dropped.emit(paths)
+        if folders:
+            self.folders_dropped.emit(folders)
         event.acceptProposedAction()
 
 
@@ -757,7 +833,12 @@ class ParamsPanel(QWidget):
         for key, label in PERFORMANCE_PROFILE_LABELS.items():
             self.combo_performance.addItem(label, key)
         self.combo_performance.currentIndexChanged.connect(self._apply_performance_profile)
-        layout.addLayout(make_param_row("macOS Profile:", self.combo_performance, "Max Quality keeps the full uniqueness filter chain and libx264 encoder"))
+        layout.addLayout(make_param_row("macOS Profile:", self.combo_performance,
+            "Sets the encoder, preset and hardware bitrate below. The filter "
+            "chain is the same in every profile.\n\n"
+            "Max Quality: libx264, slow preset.\n"
+            "Balanced: libx264, fast preset.\n"
+            "Fast Mac: VideoToolbox hardware encoder where available."))
 
         self.combo_encoder = QComboBox()
         available = available_video_encoders()
@@ -897,10 +978,16 @@ class ParamsPanel(QWidget):
         self.spin_crf.setValue(24)
         self.spin_gop_min.setValue(d.gop[0])
         self.spin_gop_max.setValue(d.gop[1])
-        self.combo_preset.setCurrentText("fast")
-        self.combo_performance.setCurrentIndex(self.combo_performance.findData(PERFORMANCE_PROFILE_QUALITY))
-        self.combo_encoder.setCurrentIndex(self.combo_encoder.findData(ENCODER_LIBX264))
-        self.spin_video_bitrate.setValue(8000)
+        # The profile owns encoder, preset and bitrate. Setting the combo does
+        # not fire currentIndexChanged when the index is already right, so the
+        # profile is applied explicitly: otherwise Reset Defaults and a fresh
+        # launch could leave "Max Quality" on screen over a `fast` preset.
+        # Balanced is the default because it is what UniqueParams defaults to.
+        self.combo_performance.blockSignals(True)
+        self.combo_performance.setCurrentIndex(
+            self.combo_performance.findData(UniqueParams().performance_profile))
+        self.combo_performance.blockSignals(False)
+        self._apply_performance_profile()
         self.spin_workers.setValue(default_worker_count())
         self.chk_fake_meta.setChecked(True)
         self.chk_micro_warp.setChecked(d.use_micro_warp)
@@ -1103,6 +1190,7 @@ class MainWindow(QMainWindow):
             self.resize(820, 740)
 
         self.worker = None
+        self.scanner = None
         self.input_files = []
         self.output_folder = ""
         # Set when the user quits mid-batch: the window closes itself once the
@@ -1155,6 +1243,10 @@ class MainWindow(QMainWindow):
         act_diag.triggered.connect(self._copy_diagnostics)
         help_menu.addAction(act_diag)
 
+        act_lic = QAction("Third-Party Licenses", self)
+        act_lic.triggered.connect(self._show_licenses)
+        help_menu.addAction(act_lic)
+
         # macOS moves an action with this role into the application menu.
         act_about = QAction("About Video Uniqualizer", self)
         act_about.setMenuRole(QAction.MenuRole.AboutRole)
@@ -1170,6 +1262,21 @@ class MainWindow(QMainWindow):
             return
         subprocess.run(["open", "-R", path], check=False)
 
+    def _show_licenses(self):
+        if getattr(sys, "frozen", False):
+            folder = os.path.join(sys._MEIPASS, "licenses")
+        else:
+            folder = os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "ffmpeg_bin", "licenses")
+        notices = os.path.join(folder, "THIRD_PARTY_NOTICES.txt")
+        if not os.path.isfile(notices):
+            QMessageBox.information(
+                self, "Third-Party Licenses",
+                "License files are added when the app is built "
+                "(./build.sh); this copy has none.")
+            return
+        subprocess.run(["open", "-R", notices], check=False)
+
     def _copy_diagnostics(self):
         text = applog.diagnostics(get_ffmpeg_path(), ffmpeg_version_line())
         QApplication.clipboard().setText(text)
@@ -1183,7 +1290,9 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, "About Video Uniqualizer",
             f"Video Uniqualizer {DISPLAY_VERSION}\n\n{applog.system_summary()}\n"
-            f"{ffmpeg_version_line()}")
+            f"{ffmpeg_version_line()}\n\n"
+            "Includes FFmpeg and other open-source libraries under the GPL and "
+            "other licenses. See Help → Third-Party Licenses.")
 
     def closeEvent(self, event: QCloseEvent):
         """Stop a running batch before the window goes away.
@@ -1194,6 +1303,10 @@ class MainWindow(QMainWindow):
         ffmpeg and deletes partial outputs — and the window closes itself when
         the worker reports back.
         """
+        if self.scanner is not None:
+            self.scanner.cancel()
+            self.scanner.wait()
+            self.scanner = None
         if self.worker is None or not self.worker.isRunning():
             event.accept()
             return
@@ -1287,6 +1400,7 @@ class MainWindow(QMainWindow):
         self.file_list.setMaximumHeight(200)
         self.file_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.file_list.files_dropped.connect(self._add_files)
+        self.file_list.folders_dropped.connect(self._scan_folders)
         # A drag-reorder rewrites the model behind our back; processing order and
         # `input_files` have to follow it.
         self.file_list.model().rowsMoved.connect(
@@ -1380,13 +1494,48 @@ class MainWindow(QMainWindow):
 
     # ─── Slots ───────────────────────────────────────────
 
+    def _scan_folders(self, folders: list):
+        if self.scanner is not None:
+            self.status_label.setText("Still scanning the previous folder — drop again when it finishes.")
+            return
+        self.status_label.setText("Scanning folder for videos and images…")
+        self.scanner = FolderScanWorker(folders, skip_dir=self.output_folder)
+        self.scanner.scanned.connect(self._on_folders_scanned)
+        self._update_button_states()
+        self.scanner.start()
+
+    def _on_folders_scanned(self, paths: list, truncated: bool):
+        if self.scanner is not None:
+            self.scanner.wait()
+            self.scanner = None
+        before = len(self.input_files)
+        self._add_files(paths)
+        added = len(self.input_files) - before
+        if not paths:
+            self.status_label.setText("No videos or images found in that folder.")
+        elif truncated:
+            self.status_label.setText(
+                f"Added {added} files — stopped at {MAX_SCAN_FILES}. "
+                "Drop a smaller folder to add the rest.")
+        else:
+            self.status_label.setText(f"Added {added} files from the folder.")
+        self._update_button_states()
+
     def _add_files(self, paths: list):
-        """Add files from drag-drop or file dialog, deduplicating."""
-        existing = set(self.input_files)
+        """Add files from drag-drop or file dialog, deduplicating.
+
+        Duplicates are matched on the resolved path, so the same file reached
+        through a symlink or a second dropped parent folder is listed once
+        rather than processed twice.
+        """
+        existing = {os.path.realpath(f) for f in self.input_files}
         for p in paths:
-            if p in existing:
+            if not _is_candidate(p):
                 continue
-            existing.add(p)
+            real = os.path.realpath(p)
+            if real in existing:
+                continue
+            existing.add(real)
             item = QListWidgetItem(os.path.basename(p))
             item.setToolTip(p)
             # The path lives on the item, not in a parallel list indexed by row:
@@ -1475,7 +1624,8 @@ class MainWindow(QMainWindow):
 
     def _update_button_states(self):
         can_start = len(self.input_files) > 0 and bool(self.output_folder)
-        self.btn_process.setEnabled(can_start and self.worker is None)
+        self.btn_process.setEnabled(
+            can_start and self.worker is None and self.scanner is None)
 
     def _cleanup_worker(self):
         """Safely wait for and discard worker thread."""
@@ -1519,11 +1669,55 @@ class MainWindow(QMainWindow):
         )
         return answer == QMessageBox.StandardButton.Yes
 
+    def _confirm_disk_space(self) -> bool:
+        """Check the output volume can plausibly hold the batch.
+
+        The estimate is 1.5x the input size: a re-encode at the default CRF
+        lands near the source for camera footage, but can exceed a heavily
+        compressed source, and a PNG out of a JPEG is several times bigger.
+        Running out mid-batch still stops cleanly (the engine detects it and
+        skips the rest), so this only warns — except when the disk is already
+        effectively full.
+        """
+        try:
+            free = shutil.disk_usage(self.output_folder).free
+        except OSError as exc:
+            log.warning("disk_usage failed for %s: %s", self.output_folder, exc)
+            return True
+        total_in = 0
+        for f in self.input_files:
+            try:
+                total_in += os.path.getsize(f)
+            except OSError:
+                pass
+        needed = int(total_in * 1.5)
+        log.info("disk check: %s free, ~%s needed", _format_bytes(free), _format_bytes(needed))
+        if free < 200 * 1024 * 1024:
+            QMessageBox.critical(
+                self, "Output Disk Is Full",
+                f"Only {_format_bytes(free)} is free on the output disk.\n\n"
+                "Choose another output folder or free up space.")
+            return False
+        if free >= needed:
+            return True
+        answer = QMessageBox.warning(
+            self, "Output Disk May Run Out of Space",
+            f"The batch may need about {_format_bytes(needed)}, but only "
+            f"{_format_bytes(free)} is free on the output disk.\n\n"
+            "If it fills up, processing stops and the unfinished files are "
+            "listed as errors. Process anyway?",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def _start_processing(self):
         if not self.input_files or not self.output_folder:
             return
 
         if not self._confirm_output_folder():
+            return
+        if not self._confirm_disk_space():
             return
 
         self.worker = ProcessWorker(

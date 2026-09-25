@@ -144,7 +144,23 @@ TARGET_WIDTH = 1080
 TARGET_HEIGHT = 1920
 
 _OUT_TIME_RE = re.compile(r"(\d+):(\d+):(\d+)\.(\d+)")
+# A slow encode is not a hung one, so the hard ceiling scales with the clip
+# (30x its duration, never under an hour). What catches a real hang is the stall
+# timeout: ffmpeg reports out_time twice a second, and a job whose output
+# position has not moved for this long is stuck on a read or a deadlock.
 _FFMPEG_TIMEOUT = 3600
+_FFMPEG_TIMEOUT_PER_SECOND = 30
+_FFMPEG_STALL_TIMEOUT = 180
+
+# Prefix of the error a job returns when the output volume filled up. The batch
+# stops scheduling new files on it: every one of them would fail the same way,
+# each after writing a partial file first.
+DISK_FULL_ERROR = "output disk is full"
+_DISK_FULL_MARKERS = ("No space left on device", "ENOSPC")
+
+
+def is_disk_full(stderr_text: str) -> bool:
+    return any(m in stderr_text for m in _DISK_FULL_MARKERS)
 ENCODER_LIBX264 = "libx264"
 ENCODER_H264_VIDEOTOOLBOX = "h264_videotoolbox"
 ENCODER_HEVC_VIDEOTOOLBOX = "hevc_videotoolbox"
@@ -1683,14 +1699,23 @@ def process_single_video(
         ]
         return cmd
 
+    deadline = max(_FFMPEG_TIMEOUT,
+                   (effective_duration or 0) * _FFMPEG_TIMEOUT_PER_SECOND)
+
     def _run(cmd: List[str]) -> Tuple[str, str]:
         """Run one ffmpeg invocation. Returns (status, detail).
 
         status is ``ok``, ``cancelled``, ``failed`` — a non-zero exit, the one
         case worth retrying on another encoder — or ``gave-up`` for a launch
-        failure or a timeout, where a second attempt would only cost the same
-        wait again. The caller owns the output file, so nothing is unlinked
-        here: a failed hardware encode is retried against the same path.
+        failure, a stall, a timeout or a full disk, where a second attempt
+        would only cost the same wait again. The caller owns the output file,
+        so nothing is unlinked here: a failed hardware encode is retried
+        against the same path.
+
+        Cancellation, the stall check and the deadline all live in a watchdog
+        thread rather than in the stdout loop. The loop blocks on ffmpeg's
+        output, so a hung ffmpeg — the case those checks exist for — used to
+        leave them unreachable, and Cancel did nothing.
         """
         try:
             proc = subprocess.Popen(
@@ -1704,43 +1729,81 @@ def process_single_video(
             return "gave-up", f"ffmpeg failed to launch: {exc}"
 
         stderr_lines: List[str] = []
-        try:
-            last_time = 0.0
+        # Monotonic time the output position last advanced; the watchdog reads it.
+        last_advance = [time.monotonic()]
+        verdict: List[str] = []
+        stop = threading.Event()
 
-            def _read_stderr():
-                if not proc.stderr:
-                    return
-                for err_line in proc.stderr:
-                    if err_line:
-                        stderr_lines.append(err_line.rstrip())
-                        if len(stderr_lines) > 30:
-                            del stderr_lines[:10]
+        def _read_stderr():
+            if not proc.stderr:
+                return
+            for err_line in proc.stderr:
+                if err_line:
+                    stderr_lines.append(err_line.rstrip())
+                    if len(stderr_lines) > 30:
+                        del stderr_lines[:10]
 
-            stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
-            stderr_thread.start()
-
-            for line in proc.stdout:
+        def _watch():
+            started = time.monotonic()
+            while not stop.wait(0.25):
+                now = time.monotonic()
                 if cancelled and cancelled():
-                    _kill_process(proc)
-                    return "cancelled", "cancelled"
+                    reason = "cancelled"
+                elif now - last_advance[0] > _FFMPEG_STALL_TIMEOUT:
+                    reason = "stalled"
+                elif now - started > deadline:
+                    reason = "deadline"
+                else:
+                    continue
+                verdict.append(reason)
+                _kill_process(proc)
+                return
 
-                if line.startswith("out_time=") and effective_duration and file_progress_callback:
-                    time_str = line.strip().split("=", 1)[1]
-                    m = _OUT_TIME_RE.match(time_str)
-                    if m:
-                        secs = (int(m.group(1)) * 3600 + int(m.group(2)) * 60
-                                + int(m.group(3)) + float(f"0.{m.group(4)}"))
-                        if secs > last_time:
-                            last_time = secs
-                            file_progress_callback(min(secs / effective_duration, 1.0))
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stderr_thread.start()
+        watchdog = threading.Thread(target=_watch, daemon=True)
+        watchdog.start()
 
-            proc.wait(timeout=_FFMPEG_TIMEOUT)
+        try:
+            last_time = -1.0
+            for line in proc.stdout:
+                if not line.startswith("out_time="):
+                    continue
+                m = _OUT_TIME_RE.match(line.strip().split("=", 1)[1])
+                if not m:
+                    continue    # "N/A" before the first frame
+                secs = (int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                        + int(m.group(3)) + float(f"0.{m.group(4)}"))
+                if secs > last_time:
+                    last_time = secs
+                    last_advance[0] = time.monotonic()
+                    if effective_duration and file_progress_callback:
+                        file_progress_callback(min(secs / effective_duration, 1.0))
+            # stdout closes as ffmpeg exits; the watchdog still covers a
+            # process that closes it and then fails to exit.
+            proc.wait()
+        finally:
+            stop.set()
+            watchdog.join(timeout=15)
             stderr_thread.join(timeout=1)
-        except subprocess.TimeoutExpired:
-            _kill_process(proc)
-            log.warning("ffmpeg timed out on %s after %ss",
-                        os.path.basename(input_path), _FFMPEG_TIMEOUT)
-            return "gave-up", f"ffmpeg timed out after {_FFMPEG_TIMEOUT}s"
+
+        name = os.path.basename(input_path)
+        if verdict:
+            if verdict[0] == "cancelled":
+                return "cancelled", "cancelled"
+            if verdict[0] == "stalled":
+                log.warning("ffmpeg made no progress on %s for %ss; killed\n"
+                            "command: %s\nstderr:\n%s", name,
+                            _FFMPEG_STALL_TIMEOUT, subprocess.list2cmdline(cmd),
+                            "\n".join(stderr_lines))
+                return "gave-up", (f"ffmpeg stopped making progress for "
+                                   f"{_FFMPEG_STALL_TIMEOUT}s and was stopped")
+            log.warning("ffmpeg exceeded %.0fs on %s; killed", deadline, name)
+            return "gave-up", f"ffmpeg timed out after {deadline:.0f}s"
+
+        if proc.returncode != 0 and is_disk_full("\n".join(stderr_lines)):
+            log.error("disk full while writing %s", output_path)
+            return "gave-up", f"{DISK_FULL_ERROR} ({output_folder})"
 
         if proc.returncode != 0:
             stderr_out = "\n".join(stderr_lines)
@@ -1848,6 +1911,8 @@ def process_batch(
     success_count = 0
     errors: List[str] = []
     active_progress = {}
+    disk_full = threading.Event()
+    not_started: List[str] = []
 
     def _report_file_progress(job_id: int, fraction: float):
         if not file_progress_callback:
@@ -1885,6 +1950,10 @@ def process_batch(
 
         if cancelled and cancelled():
             return
+        if disk_full.is_set():
+            with state_lock:
+                not_started.append(fname)
+            return
 
         with state_lock:
             active_progress[job_id] = 0.0
@@ -1918,6 +1987,8 @@ def process_batch(
             done = completed
         if not ok and err and err != "cancelled":
             log.warning("video failed: %s: %s", fpath, err)
+            if err.startswith(DISK_FULL_ERROR):
+                disk_full.set()
 
         if progress_callback:
             progress_callback(done, total, fname)
@@ -1931,6 +2002,9 @@ def process_batch(
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(_run, jobs))
+
+    if not_started:
+        errors.append(f"{len(not_started)} file(s) not started: {DISK_FULL_ERROR}")
 
     if progress_callback:
         progress_callback(total, total, "")

@@ -129,6 +129,12 @@ When measuring this, pin the twin's codec settings. Comparing a
 `compression_level 9` output against a `level 6` twin swings the ratio by more
 than 2x on its own and reads as an effects problem that is not there.
 
+### ffmpeg supervision
+
+`process_single_video._run` does not police ffmpeg from its stdout loop, because that loop blocks on ffmpeg's output and a hung ffmpeg never reaches it. A watchdog thread handles Cancel, the stall timeout (`_FFMPEG_STALL_TIMEOUT`: `out_time` not advancing) and the deadline (30x clip duration, at least an hour). A slow encode keeps advancing `out_time`, so do not replace the stall check with a tighter fixed deadline.
+
+A full output disk returns `DISK_FULL_ERROR`, and both batch functions then stop starting new files instead of failing each one after writing a partial file.
+
 ### Perceptual safety caps (do not exceed)
 
 `MAX_*` and `SPEECH_SAFE_*` constants in `engine.py` bound audio delay, rotation angle, hue rotation, and the speech-safe speed/pitch bands. `MAX_IMAGE_*` in `image_engine.py` does the same for stills, and sits **lower** than the video equivalents: a photo gets no temporal averaging and the viewer can zoom, so grain and sharpening that vanish in motion are plainly visible on it. The UI spin boxes are bounded by these same constants — a visible or audible setting must not be dialable. When changing a range, update the constant and the UI bound together, then re-run the quality gate.
@@ -145,6 +151,7 @@ Stills go further, because a JPEG's non-pixel surface is bigger than a video's: 
 - **The bundled ffmpeg must be self-contained.** A Homebrew ffmpeg is a stub over `/opt/homebrew/Cellar/*/lib`; copied alone it works on the build Mac and fails on every other one, and a plain smoke launch cannot tell. `tools/bundle_ffmpeg.py bundle` copies the dylib closure into `ffmpeg_bin/lib` relinked to `@loader_path`; the spec passes ffmpeg/ffprobe as `binaries`, so PyInstaller moves those libs into `Contents/Frameworks` under `@rpath`. `build.sh` then checks twice: `bundle_ffmpeg.py verify --boundary <app>` (every dependency resolves inside the app) and a run under `DYLD_PRINT_LIBRARIES` (dyld loads nothing from outside). Do not weaken either.
 - `LSMinimumSystemVersion` is the highest `minos` among the bundled ffmpeg Mach-Os. Homebrew bottles target the OS they were built on, so that is the real floor for testers; lowering it needs an ffmpeg built with a lower deployment target, not a plist edit.
 - The version lives only in `src/version.py`. `./build.sh share` refuses a dirty tree (`ALLOW_DIRTY=1` overrides for throwaway builds).
+- Third-party licenses: `bundle_ffmpeg.py` copies each keg's license files and writes `THIRD_PARTY_NOTICES.txt` into `ffmpeg_bin/licenses`, shipped as `Contents/Resources/licenses` (Help → Third-Party Licenses). The Homebrew ffmpeg is `--enable-gpl --enable-version3`, so distributing the app means distributing GPLv3 binaries; `build.sh` fails if the notices are missing.
 - `src/applog.py` writes `~/Library/Logs/Video Uniqualizer/app.log` (rotating). The engines log ffmpeg failures with the full command and stderr tail; the UI only shows 500 characters. Help → Copy Diagnostics is what testers paste into bug reports.
 - Apple Silicon requires arm64 (or universal) ffmpeg/ffprobe in `ffmpeg_bin/`; x86_64-only binaries fail the build rather than producing a Rosetta build. Check with `lipo -archs ffmpeg_bin/ffmpeg`.
 - Ad-hoc code signing is mandatory on Apple Silicon (`codesign --force --deep --sign -`) — without it the app crashes on launch.

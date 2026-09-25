@@ -21,6 +21,12 @@ load on macOS 15 no matter where it sits; build.sh writes that value into
 LSMinimumSystemVersion so an older Mac refuses the app up front instead of
 failing every file.
 
+``bundle`` also copies each library's license files out of its Homebrew keg
+into ``<dest>/licenses`` and writes THIRD_PARTY_NOTICES.txt. The Homebrew
+ffmpeg is configured with --enable-gpl --enable-version3 and links x264/x265,
+so what ships is GPLv3 code: distributing it, even to closed-beta testers,
+carries the license texts and a source offer along with it.
+
 Stdlib only; it runs before the build venv matters.
 """
 
@@ -35,6 +41,9 @@ from typing import Dict, List, Optional, Tuple
 
 EXECUTABLES = ("ffmpeg", "ffprobe")
 LIB_DIR = "lib"
+LICENSE_DIR = "licenses"
+NOTICES_FILE = "THIRD_PARTY_NOTICES.txt"
+_LICENSE_PREFIXES = ("license", "licence", "copying", "copyright", "notice")
 SYSTEM_PREFIXES = ("/System/", "/usr/lib/")
 
 
@@ -182,8 +191,104 @@ def bundle(sources: Dict[str, str], dest: str) -> None:
         # install_name_tool leaves the old signature invalid; arm64 refuses it.
         _run(["codesign", "--force", "--sign", "-", bundled])
 
+    collect_licenses(list(placed), dest, sources["ffmpeg"])
     print(f"Bundled {len(sources)} executables and "
           f"{len(placed) - len(sources)} libraries into {dest}")
+
+
+def _keg(path: str) -> Optional[Tuple[str, str, str]]:
+    """(keg dir, formula, version) for a file inside a Homebrew Cellar."""
+    parts = os.path.realpath(path).split(os.sep)
+    if "Cellar" not in parts:
+        return None
+    i = parts.index("Cellar")
+    if len(parts) < i + 3:
+        return None
+    return os.sep.join(parts[:i + 3]), parts[i + 1], parts[i + 2]
+
+
+def _ffmpeg_configuration(ffmpeg: str) -> str:
+    try:
+        out = subprocess.run([ffmpeg, "-hide_banner", "-version"],
+                             capture_output=True, text=True).stdout
+    except OSError:
+        return ""
+    for ln in out.splitlines():
+        if ln.startswith("configuration:"):
+            return ln
+    return ""
+
+
+def collect_licenses(originals: List[str], dest: str, ffmpeg_src: str) -> None:
+    """Copy license files for every bundled component; write the notices file."""
+    lic_root = os.path.join(dest, LICENSE_DIR)
+    if os.path.isdir(lic_root):
+        shutil.rmtree(lic_root)
+    os.makedirs(lic_root)
+
+    kegs: Dict[str, Tuple[str, str]] = {}
+    unknown: List[str] = []
+    for path in originals:
+        keg = _keg(path)
+        if keg is None:
+            unknown.append(os.path.basename(path))
+        else:
+            kegs[keg[0]] = (keg[1], keg[2])
+
+    rows, missing = [], []
+    for keg_dir, (formula, version) in sorted(kegs.items(), key=lambda kv: kv[1]):
+        files = sorted(f for f in os.listdir(keg_dir)
+                       if f.lower().startswith(_LICENSE_PREFIXES)
+                       and os.path.isfile(os.path.join(keg_dir, f)))
+        out_dir = os.path.join(lic_root, f"{formula}-{version}")
+        os.makedirs(out_dir)
+        for f in files:
+            shutil.copy2(os.path.join(keg_dir, f), os.path.join(out_dir, f))
+        if not files:
+            missing.append(formula)
+        rows.append(f"  {formula} {version}: "
+                    + (", ".join(files) if files else "NO LICENSE FILE FOUND"))
+
+    config = _ffmpeg_configuration(os.path.realpath(ffmpeg_src))
+    gpl = "--enable-gpl" in config
+    v3 = "--enable-version3" in config
+    ffmpeg_keg = _keg(ffmpeg_src)
+    ffmpeg_version = ffmpeg_keg[2].split("_")[0] if ffmpeg_keg else "unknown"
+    lines = [
+        "Third-party software bundled with Video Uniqualizer",
+        "=" * 51,
+        "",
+        "The app runs the ffmpeg and ffprobe command-line programs from the",
+        "FFmpeg project, together with the libraries listed below. Each",
+        "component's license text is in the folder of the same name next to",
+        "this file.",
+        "",
+    ]
+    if gpl:
+        lines += [
+            f"This FFmpeg build is configured with --enable-gpl"
+            f"{' --enable-version3' if v3 else ''}, so ffmpeg and ffprobe as",
+            f"shipped are licensed under the GNU GPL version {'3' if v3 else '2'} or later.",
+            "",
+            "Source code: FFmpeg " + ffmpeg_version + " is available from",
+            f"https://ffmpeg.org/releases/ffmpeg-{ffmpeg_version}.tar.xz, and the",
+            "build recipe (including any patches) from Homebrew's ffmpeg formula,",
+            "https://github.com/Homebrew/homebrew-core. Source for the other",
+            "libraries is available from the Homebrew formulae of the same name.",
+            "",
+        ]
+    lines += ["Components:", *rows]
+    if unknown:
+        lines += ["", "Not from Homebrew (check licensing by hand):",
+                  *[f"  {u}" for u in unknown]]
+    if config:
+        lines += ["", "FFmpeg " + config]
+    with open(os.path.join(lic_root, NOTICES_FILE), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    for name in missing + unknown:
+        print(f"WARNING: no license file found for {name}; add it by hand",
+              file=sys.stderr)
 
 
 def verify(root: str, require: Tuple[str, ...] = (),

@@ -38,6 +38,7 @@ from typing import Callable, List, Optional, Tuple
 import exif
 from engine import (
     DEVICE_PROFILES,
+    DISK_FULL_ERROR,
     MAX_HUE_DEGREES,
     MAX_ROTATE_DEGREES,
     MAX_CURVE_JITTER,
@@ -50,6 +51,7 @@ from engine import (
     default_worker_count,
     generate_gps_coords,
     get_ffmpeg_path,
+    is_disk_full,
     reserve_natural_filepath,
     _set_file_times,
     plan_geometry,
@@ -614,6 +616,11 @@ def process_single_image(
         _cleanup(output_path)
         return False, f"ffmpeg failed to launch: {exc}"
 
+    if proc.returncode != 0 and is_disk_full(proc.stderr):
+        _cleanup(output_path)
+        log.error("disk full while writing %s", output_path)
+        return False, f"{DISK_FULL_ERROR} ({output_folder})"
+
     if proc.returncode != 0:
         _cleanup(output_path)
         log.warning("ffmpeg failed on %s (exit %s)\ncommand: %s\nstderr:\n%s",
@@ -715,6 +722,8 @@ def process_image_batch(
     completed = 0
     success_count = 0
     errors: List[str] = []
+    disk_full = threading.Event()
+    not_started: List[str] = []
 
     def _run(job: Tuple[int, str]):
         """Never raises.
@@ -744,6 +753,10 @@ def process_image_batch(
 
         if cancelled and cancelled():
             return
+        if disk_full.is_set():
+            with state_lock:
+                not_started.append(fname)
+            return
 
         params = ImageParams.generate_random(ranges)
         if params_template:
@@ -767,6 +780,8 @@ def process_image_batch(
             done = completed
         if not ok and err and err != "cancelled":
             log.warning("image failed: %s: %s", fpath, err)
+            if err.startswith(DISK_FULL_ERROR):
+                disk_full.set()
 
         if progress_callback:
             progress_callback(done, total, fname)
@@ -781,4 +796,6 @@ def process_image_batch(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(_run, jobs))
 
+    if not_started:
+        errors.append(f"{len(not_started)} file(s) not started: {DISK_FULL_ERROR}")
     return success_count, errors

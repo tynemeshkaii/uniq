@@ -37,6 +37,11 @@ for _tool in ('ffmpeg', 'ffprobe'):
     if os.path.isfile(os.path.join(FFMPEG_DIR, _tool)):
         binaries.append((os.path.join(FFMPEG_DIR, _tool), 'ffmpeg'))
 
+# License texts and THIRD_PARTY_NOTICES.txt for the bundled ffmpeg and its
+# libraries; required to distribute the GPL build (see tools/bundle_ffmpeg.py).
+if os.path.isdir(os.path.join(FFMPEG_DIR, 'licenses')):
+    datas.append((os.path.join(FFMPEG_DIR, 'licenses'), 'licenses'))
+
 # Version comes from src/version.py so the About text, the log header and
 # Info.plist cannot disagree.
 _version_ns = {}

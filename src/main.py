@@ -15,10 +15,11 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QListWidget, QListWidgetItem, QFileDialog,
     QProgressBar, QGroupBox, QDoubleSpinBox, QSpinBox, QCheckBox,
     QComboBox, QTabWidget, QScrollArea, QFrame, QSizePolicy,
-    QAbstractItemView, QGridLayout, QMessageBox, QInputDialog
+    QAbstractItemView, QGridLayout, QMessageBox, QInputDialog,
+    QDialog, QDialogButtonBox, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, QThread, QObject, QTimer, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, QUrl, QMimeData
-from PyQt6.QtGui import QAction, QCloseEvent, QColor, QIcon, QFont, QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QIcon, QFont, QDragEnterEvent, QDropEvent
 
 from engine import (
     ENCODER_H264_VIDEOTOOLBOX,
@@ -70,7 +71,9 @@ from icons import (
 from styles import MAIN_STYLESHEET
 import applog
 import settings_store
-from version import DISPLAY_VERSION
+import updates
+from version import DISPLAY_VERSION, ISSUES_URL
+from urllib.parse import urlencode
 
 log = logging.getLogger("app")
 
@@ -1311,6 +1314,75 @@ class ParamsPanel(QWidget):
 
 # ─── Main Window ────────────────────────────────────────
 
+class ReportDialog(QDialog):
+    """Collects a description and writes a report zip the tester sends on.
+
+    Nothing leaves the machine from here. The zip goes to the Desktop and is
+    shown in Finder; opening a GitHub issue is a separate, explicit step,
+    because issues on this repository are public.
+    """
+
+    def __init__(self, parent=None, previous_crash=None):
+        super().__init__(parent)
+        self.setWindowTitle("Report a Problem")
+        self.setMinimumWidth(520)
+        self.previous_crash = previous_crash
+        lay = QVBoxLayout(self)
+
+        intro = ("Video Uniqualizer quit unexpectedly last time. A report helps "
+                 "find out why.\n\n" if previous_crash else "")
+        lbl = QLabel(intro + "What were you doing, and what went wrong?")
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+
+        self.text = QPlainTextEdit()
+        self.text.setPlaceholderText(
+            "e.g. Dropped 12 iPhone videos, pressed Uniqualize, the app froze at 40%.")
+        self.text.setMinimumHeight(120)
+        lay.addWidget(self.text)
+
+        self.chk_logs = QCheckBox("Include the app log (recommended)")
+        self.chk_logs.setChecked(True)
+        lay.addWidget(self.chk_logs)
+        note = QLabel("The log lists the names and folders of files you processed. "
+                      "No media is included either way.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #888;")
+        lay.addWidget(note)
+
+        buttons = QDialogButtonBox()
+        buttons.addButton("Create Report", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def description(self) -> str:
+        return self.text.toPlainText()
+
+
+def issue_url(description: str, report_name: str) -> str:
+    """A pre-filled 'new issue' link. Carries no log content, only a summary."""
+    first_line = (description.strip().splitlines() or ["Problem report"])[0][:80]
+    body = (f"**What happened**\n{description.strip()[:1500] or '(describe the problem)'}\n\n"
+            f"**Environment**\n{applog.system_summary()}\n\n"
+            f"**Report file**\nPlease drag `{report_name}` from your Desktop into this issue.")
+    return f"{ISSUES_URL}?{urlencode({'title': first_line, 'body': body})}"
+
+
+class UpdateCheckWorker(QThread):
+    """Runs one update check off the GUI thread (curl can take seconds)."""
+    found = pyqtSignal(object)      # updates.Release or None
+    failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            self.found.emit(updates.check_for_update())
+        except updates.UpdateCheckError as exc:
+            log.info("update check failed: %s", exc)
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1327,6 +1399,7 @@ class MainWindow(QMainWindow):
 
         self.worker = None
         self.scanner = None
+        self.update_checker = None
         self.input_files = []
         self.output_folder = ""
         # Set when the user quits mid-batch: the window closes itself once the
@@ -1384,6 +1457,22 @@ class MainWindow(QMainWindow):
         act_diag = QAction("Copy Diagnostics", self)
         act_diag.triggered.connect(self._copy_diagnostics)
         help_menu.addAction(act_diag)
+
+        act_report = QAction("Report a Problem…", self)
+        act_report.triggered.connect(lambda: self.open_report_dialog())
+        help_menu.addAction(act_report)
+
+        help_menu.addSeparator()
+        act_update = QAction("Check for Updates…", self)
+        act_update.triggered.connect(lambda: self.check_for_updates(manual=True))
+        help_menu.addAction(act_update)
+
+        self.act_auto_update = QAction("Check for Updates Automatically", self)
+        self.act_auto_update.setCheckable(True)
+        self.act_auto_update.toggled.connect(
+            lambda on: settings_store.settings().setValue("updates/auto", on))
+        help_menu.addAction(self.act_auto_update)
+        help_menu.addSeparator()
 
         act_lic = QAction("Third-Party Licenses", self)
         act_lic.triggered.connect(self._show_licenses)
@@ -1449,6 +1538,8 @@ class MainWindow(QMainWindow):
             self.scanner.cancel()
             self.scanner.wait()
             self.scanner = None
+        if self.update_checker is not None:
+            self.update_checker.wait(20000)   # curl has its own 15 s timeout
         if self.worker is None or not self.worker.isRunning():
             self._save_settings()
             event.accept()
@@ -1654,6 +1745,114 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         return card
+
+    # ─── Problem reports ─────────────────────────────────
+
+    def open_report_dialog(self, previous_crash=None):
+        dlg = ReportDialog(self, previous_crash=previous_crash)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        try:
+            path = applog.build_report(
+                dlg.description(), dlg.chk_logs.isChecked(),
+                self.params_panel.get_state(), get_ffmpeg_path(),
+                ffmpeg_version_line(), previous_crash=previous_crash)
+        except OSError as exc:
+            log.exception("could not write report")
+            QMessageBox.critical(self, "Report Not Created", f"Could not write the report:\n{exc}")
+            return None
+        subprocess.run(["open", "-R", path], check=False)
+        box = QMessageBox(QMessageBox.Icon.Information, "Report Created",
+                          f"The report is at:\n{path}\n\n"
+                          "Send it to whoever gave you this build, or attach it to "
+                          "a GitHub issue. Issues are public — check the file "
+                          "before attaching it.", parent=self)
+        gh = box.addButton("Open GitHub Issue", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is gh:
+            QDesktopServices.openUrl(QUrl(issue_url(dlg.description(), os.path.basename(path))))
+        return path
+
+    def offer_crash_report(self, previous_crash):
+        """Called once at startup when the last session ended abnormally."""
+        if not previous_crash:
+            return
+        answer = QMessageBox.question(
+            self, "Video Uniqualizer Quit Unexpectedly",
+            "The app did not shut down normally last time.\n\n"
+            "Create a problem report now? It takes a minute and helps fix it.",
+            QMessageBox.StandardButton.No | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Yes)
+        if answer == QMessageBox.StandardButton.Yes:
+            self.open_report_dialog(previous_crash=previous_crash)
+
+    # ─── Updates ─────────────────────────────────────────
+
+    _AUTO_CHECK_INTERVAL = 24 * 3600
+
+    def startup_update_check(self):
+        """Ask once whether to check automatically; then check at most daily.
+
+        The check contacts GitHub, so it is not done without the tester having
+        said yes once.
+        """
+        s = settings_store.settings()
+        if not s.value("updates/asked", False, type=bool):
+            s.setValue("updates/asked", True)
+            answer = QMessageBox.question(
+                self, "Check for Updates Automatically?",
+                "Video Uniqualizer can check GitHub once a day for a newer beta "
+                "and tell you when one is out. Nothing but the request itself "
+                "is sent.\n\nYou can change this in the Help menu.",
+                QMessageBox.StandardButton.No | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Yes)
+            s.setValue("updates/auto", answer == QMessageBox.StandardButton.Yes)
+        auto = s.value("updates/auto", False, type=bool)
+        self.act_auto_update.blockSignals(True)
+        self.act_auto_update.setChecked(auto)
+        self.act_auto_update.blockSignals(False)
+        last = s.value("updates/last_check", 0.0, type=float)
+        if auto and time.time() - last > self._AUTO_CHECK_INTERVAL:
+            self.check_for_updates(manual=False)
+
+    def check_for_updates(self, manual: bool):
+        if self.update_checker is not None:
+            return
+        self.update_checker = UpdateCheckWorker(self)
+        self.update_checker.found.connect(lambda r: self._on_update_result(r, manual))
+        self.update_checker.failed.connect(lambda e: self._on_update_failed(e, manual))
+        self.update_checker.finished.connect(self._on_update_thread_done)
+        self.update_checker.start()
+
+    def _on_update_thread_done(self):
+        if self.update_checker is not None:
+            self.update_checker.wait()
+            self.update_checker = None
+
+    def _on_update_result(self, release, manual: bool):
+        settings_store.settings().setValue("updates/last_check", time.time())
+        if release is None:
+            if manual:
+                QMessageBox.information(self, "No Update",
+                                        f"Video Uniqualizer {DISPLAY_VERSION} is the newest version.")
+            return
+        notes = release.notes.strip()
+        if len(notes) > 800:
+            notes = notes[:800] + "…"
+        box = QMessageBox(QMessageBox.Icon.Information, "Update Available",
+                          f"{release.name} is available (you have {DISPLAY_VERSION})."
+                          + (f"\n\n{notes}" if notes else ""), parent=self)
+        get = box.addButton("Download…", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is get and release.url:
+            QDesktopServices.openUrl(QUrl(release.url))
+
+    def _on_update_failed(self, error: str, manual: bool):
+        if manual:
+            QMessageBox.warning(self, "Update Check Failed",
+                                f"Could not reach GitHub:\n{error}")
 
     # ─── Settings & presets ──────────────────────────────
 
@@ -2221,7 +2420,12 @@ def _ffmpeg_missing_text(err: str) -> str:
 
 
 def main():
+    # build.sh launches the bundle for a few seconds and then kills it. That
+    # run must not arm the crash marker (the kill would read as a crash at the
+    # builder's next launch) or answer first-launch questions on their behalf.
+    smoke_test = os.environ.get("UNIQ_SMOKE_TEST") == "1"
     applog.setup_logging()
+    previous_crash = None if smoke_test else applog.start_session()
     _install_exception_hook()
     log.info("start: %s", applog.system_summary())
     log.info("ffmpeg: %s — %s", get_ffmpeg_path(), ffmpeg_version_line())
@@ -2260,6 +2464,11 @@ def main():
 
     window = MainWindow()
     window.show()
+    # After the window is up, so the prompts have a parent and the first
+    # paint is not held behind a dialog.
+    if not smoke_test:
+        QTimer.singleShot(400, lambda: window.offer_crash_report(previous_crash))
+        QTimer.singleShot(1500, window.startup_update_check)
 
     code = app.exec()
     log.info("exit (%s)", code)

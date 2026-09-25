@@ -41,7 +41,31 @@ If macOS still blocks the app:
 4. Click `Open Anyway`
 5. Launch the app again
 
-## If Something Goes Wrong
+## Requirements
+
+- Apple Silicon Mac (M1 or newer)
+- The macOS version printed as "Requires" in `RELEASE_NOTES.txt`
+
+## Reporting A Problem
+
+Inside the app, use **Help → Report a Problem…**. Describe what happened and
+click *Create Report*. A file named `VideoUniqualizer-report-<date>.zip`
+appears on your Desktop — send that file back. It contains the app's log,
+your settings and crash traces, never your media. Untick *Include the app
+log* if the names of the files you processed are confidential.
+
+If the app crashed or was force-quit, it offers to create this report the
+next time you open it.
+
+The *Open GitHub Issue* button opens a public issue page; only use it if you
+are fine with the description being public.
+
+## Getting New Betas
+
+Use **Help → Check for Updates…**, or allow the automatic daily check when
+the app asks on first launch. It only contacts GitHub's public release list.
+
+## If The App Does Not Open
 
 Please send back:
 

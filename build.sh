@@ -32,6 +32,16 @@ APP_VERSION="$(cd "$SRC_DIR" && python3 -c 'from version import DISPLAY_VERSION;
 BUILD_NUMBER="$(git -C "$SCRIPT_DIR" rev-list --count HEAD 2>/dev/null || echo 1)"
 BUILD_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 MIN_MACOS=""
+# Signing. Without DEVELOPER_ID the build is ad-hoc signed, which runs on the
+# build Mac and on testers' Macs after a Gatekeeper override. With it — the
+# full "Developer ID Application: Name (TEAMID)" string from
+# `security find-identity -v -p codesigning` — the app is signed with the
+# hardened runtime, and with NOTARY_PROFILE (a keychain profile created by
+# `xcrun notarytool store-credentials`) the DMG is also notarized and stapled,
+# so it opens on any Mac without warnings.
+DEVELOPER_ID="${DEVELOPER_ID:-}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-}"
+ENTITLEMENTS="$SCRIPT_DIR/packaging/entitlements.plist"
 DIRTY_NOTE=""
 if [ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]; then
     DIRTY_NOTE=", uncommitted changes"
@@ -278,30 +288,52 @@ optimize_bundle() {
     fi
 }
 
+# codesign for one path, ad-hoc or Developer ID with the hardened runtime.
+sign_path() {
+    if [ -n "$DEVELOPER_ID" ]; then
+        codesign --force --timestamp --options runtime \
+            --entitlements "$ENTITLEMENTS" --sign "$DEVELOPER_ID" "$1"
+    else
+        codesign --force --sign - "$1"
+    fi
+}
+
 sign_bundle() {
     echo ""
-    echo "[6/7] Code signing (ad-hoc)..."
+    if [ -n "$DEVELOPER_ID" ]; then
+        echo "[6/7] Code signing (Developer ID: $DEVELOPER_ID)..."
+    else
+        echo "[6/7] Code signing (ad-hoc)..."
+    fi
 
-    echo "  Signing .so files..."
-    find "$APP_DIR" -name '*.so' -exec codesign --force --sign - {} \; 2>/dev/null || true
+    # Inside out: a container's signature seals the signatures of what it
+    # holds, so every nested binary is signed before the thing around it.
+    echo "  Signing .so and .dylib files..."
+    find "$APP_DIR" -type f \( -name '*.so' -o -name '*.dylib' \) | while IFS= read -r f; do
+        sign_path "$f" 2>/dev/null || { [ -z "$DEVELOPER_ID" ] || fail "could not sign $f"; }
+    done
 
-    echo "  Signing .dylib files..."
-    find "$APP_DIR" -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
+    echo "  Signing bundled ffmpeg binaries..."
+    find "$APP_DIR" -type f \( -path '*/ffmpeg/ffmpeg' -o -path '*/ffmpeg/ffprobe' \) | while IFS= read -r f; do
+        sign_path "$f"
+    done
 
     echo "  Signing frameworks..."
     find "$APP_DIR" -type d -name '*.framework' | while IFS= read -r framework; do
-        codesign --force --sign - "$framework" 2>/dev/null || true
+        sign_path "$framework" 2>/dev/null || { [ -z "$DEVELOPER_ID" ] || fail "could not sign $framework"; }
     done
 
     echo "  Signing main executable..."
-    codesign --force --sign - "$MACOS_DIR/$APP_NAME" 2>/dev/null || true
+    sign_path "$MACOS_DIR/$APP_NAME"
 
-    echo "  Signing bundled ffmpeg binaries..."
-    find "$APP_DIR" -path '*/ffmpeg/ffmpeg' -type f -exec codesign --force --sign - {} \;
-    find "$APP_DIR" -path '*/ffmpeg/ffprobe' -type f -exec codesign --force --sign - {} \;
-
-    echo "  Signing the entire .app bundle..."
-    codesign --force --deep --sign - "$APP_DIR"
+    echo "  Signing the .app bundle..."
+    if [ -n "$DEVELOPER_ID" ]; then
+        # --deep is deprecated for distribution signing and would re-sign the
+        # nested code without the entitlements; everything is signed above.
+        sign_path "$APP_DIR"
+    else
+        codesign --force --deep --sign - "$APP_DIR"
+    fi
 }
 
 verify_codesign() {
@@ -359,7 +391,10 @@ smoke_test_app() {
     mkdir -p "$BUILD_DIR"
     rm -f "$SMOKE_LOG"
 
-    "$MACOS_DIR/$APP_NAME" >"$SMOKE_LOG" 2>&1 &
+    # Own HOME so the run's log stays out of the builder's ~/Library/Logs;
+    # UNIQ_SMOKE_TEST skips the crash marker and the first-launch prompts.
+    mkdir -p "$BUILD_DIR/smoke-home"
+    HOME="$BUILD_DIR/smoke-home" UNIQ_SMOKE_TEST=1 "$MACOS_DIR/$APP_NAME" >"$SMOKE_LOG" 2>&1 &
     local app_pid=$!
     sleep 3
 
@@ -386,7 +421,9 @@ check_spctl_status() {
         echo "  ✓ Gatekeeper assessment passed"
     else
         echo "  WARNING: Gatekeeper rejected this build."
-        echo "  This is expected for internal distribution without Developer ID notarization."
+        if [ -z "$NOTARY_PROFILE" ]; then
+            echo "  This is expected for a build that is not notarized."
+        fi
         echo "$spctl_output" | sed 's/^/    /'
     fi
 }
@@ -411,6 +448,25 @@ create_dmg() {
         -srcfolder "$APP_DIR" \
         -ov -format UDZO \
         "$DMG_PATH"
+
+    if [ -n "$DEVELOPER_ID" ]; then
+        codesign --force --timestamp --sign "$DEVELOPER_ID" "$DMG_PATH"
+    fi
+}
+
+# Notarization happens on the DMG: Apple scans everything inside it, and the
+# ticket stapled to the DMG covers the app for offline first launches.
+notarize_dmg() {
+    [ -n "$NOTARY_PROFILE" ] || return 0
+    [ -n "$DEVELOPER_ID" ] || fail "NOTARY_PROFILE needs DEVELOPER_ID: Apple rejects ad-hoc signed code"
+    echo "[share] Notarizing (this usually takes a few minutes)..."
+    xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait \
+        || fail "Notarization failed. See: xcrun notarytool log <submission-id> --keychain-profile $NOTARY_PROFILE"
+    xcrun stapler staple "$DMG_PATH"
+    xcrun stapler validate "$DMG_PATH"
+    spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG_PATH" \
+        || fail "Gatekeeper rejects the notarized DMG"
+    echo "  ✓ Notarized and stapled"
 }
 
 create_checksum() {
@@ -424,8 +480,14 @@ create_checksum() {
 create_release_notes() {
     echo "[share] Writing release notes..."
 
-    local build_date
+    local build_date gatekeeper
     build_date="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    if [ -n "$NOTARY_PROFILE" ]; then
+        gatekeeper="- The app is signed with Developer ID and notarized; it opens normally."
+    else
+        gatekeeper="- The app is not notarized.
+- macOS Gatekeeper may block the first launch until the tester manually confirms it."
+    fi
 
     cat > "$RELEASE_NOTES_PATH" <<EOF
 Video Uniqualizer $APP_VERSION (build $BUILD_NUMBER, commit $BUILD_COMMIT$DIRTY_NOTE)
@@ -442,8 +504,7 @@ shasum -a 256 "$APP_NAME.dmg"
 
 Expected first-run behavior on another Mac:
 - The app bundle is valid and self-contained.
-- The app is not notarized yet.
-- macOS Gatekeeper may block the first launch until the tester manually confirms it.
+$gatekeeper
 
 Tester install steps:
 1. Open $APP_NAME.dmg
@@ -456,7 +517,12 @@ Support note:
 - Do not disable Gatekeeper globally.
 - Do not change SIP.
 - If launch still fails, send back the exact macOS warning dialog and the build artifacts you received.
-- For any processing problem, use Help -> Copy Diagnostics in the app and paste the result into your report.
+- For any problem, use Help -> Report a Problem in the app. It writes a report
+  zip to your Desktop; send that file back. If the app crashed, it offers to
+  make the report on the next launch.
+- New betas: Help -> Check for Updates.
+
+Changes in this build: see CHANGELOG.md in the repository.
 EOF
 }
 
@@ -514,6 +580,7 @@ main() {
 
     if [ "$MODE" = "share" ]; then
         create_dmg
+        notarize_dmg
         create_checksum
         create_release_notes
         copy_testing_guide

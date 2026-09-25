@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements, used only for Developer ID builds
+  (DEVELOPER_ID set when running build.sh). Ad-hoc builds ignore this file.
+
+  allow-unsigned-executable-memory: CPython's ctypes/libffi writes executable
+  trampolines at runtime, which the hardened runtime otherwise refuses. Nothing
+  else is granted: every bundled library is signed with the same identity, so
+  library validation can stay on.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>

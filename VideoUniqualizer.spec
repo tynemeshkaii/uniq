@@ -23,6 +23,7 @@ datas = [
     (os.path.join(SRC_DIR, 'version.py'), '.'),
     (os.path.join(SRC_DIR, 'applog.py'), '.'),
     (os.path.join(SRC_DIR, 'settings_store.py'), '.'),
+    (os.path.join(SRC_DIR, 'updates.py'), '.'),
 ]
 # fingerprint.py and verify_quality.py are deliberately absent: they are the
 # dev-time measurement tools and nothing in main.py imports them, so they stay

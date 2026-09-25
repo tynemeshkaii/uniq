@@ -273,6 +273,33 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
 }
 
 /* ─── SPIN BOXES & LINE EDITS ────────────────────────── */
+/* ─── DIALOGS ──────────────────────────────────────────
+   Every dialog (message boxes, the preset name prompt, the problem report)
+   inherits the global light text colour. Without a dark background of its
+   own it rendered light grey on the system's light dialog background —
+   including the end-of-batch summary and every error message. */
+QDialog, QMessageBox, QInputDialog {
+    background: #232329;
+}
+
+QLineEdit, QPlainTextEdit {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #252530,
+        stop:1 #1E1E28
+    );
+    border: 1px solid #3A3A48;
+    border-top: 1px solid rgba(0, 0, 0, 40);
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: #D0D0DC;
+    selection-background-color: #5A3FA0;
+}
+
+QLineEdit:focus, QPlainTextEdit:focus {
+    border: 1px solid #6B4FB8;
+}
+
 QDoubleSpinBox, QSpinBox {
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,

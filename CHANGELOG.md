@@ -9,6 +9,16 @@ release job publishes that section as the GitHub release notes.
 ## Unreleased
 
 ### Fixed
+- HDR videos from iPhones (HLG / Dolby Vision) and HDR10 sources came out as
+  8-bit HDR, which shows banding and looks washed out anywhere HDR is not
+  honoured. They are now converted to standard SDR (BT.709), with HDR
+  reference white mapped to SDR white.
+- "Fast Mac (HEVC)" outputs are now tagged `hvc1`, so QuickTime, Safari and
+  iPhones play them.
+- "Fast Mac (HEVC)" no longer runs the H.264 SEI filter, which in HEVC matches
+  a kind of picture rather than SEI and could drop frames.
+- Variable-frame-rate phone clips that report an absurd nominal frame rate no
+  longer risk an output flooded with duplicated frames.
 - Check for Updates failed with "HTTP 403" when GitHub's hourly limit for
   anonymous requests was used up (common behind shared office or VPN
   addresses). It now falls back to the release feed, which has no such limit.

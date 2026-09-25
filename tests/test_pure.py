@@ -113,6 +113,54 @@ def test_video_graph_is_deterministic_for_a_seed():
     assert _video_graphs() == _video_graphs()
 
 
+# ─── HDR, bitstream filters, frame rate ────────────────────
+
+def test_hdr_step_sits_between_geometry_and_effects():
+    """Converted after the downscale (cheap), before the colour stage (which
+    was tuned on SDR). Both branches get it when the backdrop is built."""
+    random.seed(7)
+    p = UniqueParams.generate_random(RandomRanges())
+    p.target_width, p.target_height = 1080, 1920
+    step = engine.build_hdr_to_sdr_step("arib-std-b67")
+
+    same_aspect = build_video_chain(p, plan_geometry(1080, 1920, p), False, 30.0, step)
+    steps = same_aspect.split("[0:v]", 1)[1].split("[base]")[0].split(",")
+    at = steps.index(step)
+    assert steps[at - 1] == "setsar=1"
+    assert steps[at + 1].startswith(("curves=", "colorbalance="))
+
+    backdrop = build_video_chain(p, plan_geometry(1920, 1080, p), False, 30.0, step)
+    assert backdrop.count(step) == 2
+
+
+def test_no_hdr_step_leaves_the_graph_alone():
+    random.seed(8)
+    p = UniqueParams.generate_random(RandomRanges())
+    plan = plan_geometry(1080, 1920, p)
+    assert build_video_chain(p, plan, False, 30.0) == build_video_chain(p, plan, False, 30.0, "")
+    assert "in_transfer" not in build_video_chain(p, plan, False, 30.0)
+
+
+def test_sei_strip_bsf_is_per_codec():
+    """HEVC type 6 is RADL_N, a picture; its SEI types are 39 and 40."""
+    assert engine.sei_strip_bsf(engine.ENCODER_LIBX264).endswith("remove_types=6")
+    assert engine.sei_strip_bsf(engine.ENCODER_H264_VIDEOTOOLBOX).endswith("remove_types=6")
+    assert engine.sei_strip_bsf(engine.ENCODER_HEVC_VIDEOTOOLBOX).endswith("remove_types=39|40")
+
+
+@pytest.mark.parametrize("rate, expected", [
+    ("30/1", 30.0),
+    ("30000/1001", 30000 / 1001),
+    ("90000/1", 0.0),      # container timebase reported by a VFR phone clip
+    ("0/0", 0.0),
+    ("", 0.0),
+    (None, 0.0),
+    ("garbage", 0.0),
+])
+def test_parse_rate(rate, expected):
+    assert engine._parse_rate(rate) == pytest.approx(expected)
+
+
 # ─── Output naming ─────────────────────────────────────────
 
 def test_unique_filepath_reserves_and_suffixes(tmp_path):

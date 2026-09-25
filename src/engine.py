@@ -218,6 +218,29 @@ WARP_DRIFT_PERIOD_FRAMES = (900, 1800)
 # Strip SEI NAL units — x264 writes its full option string there, which both
 # identifies the encoder and leaks the randomized tuning parameters.
 SEI_STRIP_BSF = "filter_units=remove_types=6"
+# NAL type numbers are per codec. In HEVC, 6 is RADL_N — a coded picture — so
+# the H.264 filter applied to HEVC would delete frames and leave the SEI (39
+# prefix, 40 suffix) alone. filter_units only rewrites packets, not the hvcC
+# extradata, so an SEI an encoder puts in its global header survives either way.
+HEVC_SEI_STRIP_BSF = "filter_units=remove_types=39|40"
+
+
+def sei_strip_bsf(encoder: str) -> str:
+    """The SEI-removing bitstream filter for the codec ``encoder`` writes."""
+    return HEVC_SEI_STRIP_BSF if encoder == ENCODER_HEVC_VIDEOTOOLBOX else SEI_STRIP_BSF
+
+
+# Transfer characteristics that mark an HDR source. iPhones record HLG (with a
+# Dolby Vision layer, which is HLG-compatible) by default; PQ comes from
+# HDR10 cameras and grading tools. The pipeline encodes 8-bit BT.709, so these
+# have to be converted, not just truncated: decoding the HDR code values as if
+# they were SDR is what produced flat, washed-out outputs.
+HDR_TRANSFERS = ("arib-std-b67", "smpte2084")
+
+# A frame rate outside this is not a real one. Phone VFR files can report an
+# r_frame_rate of the container timebase (90000/1), and handing that to the
+# fps filter would duplicate every frame thousands of times.
+MAX_SANE_FPS = 240.0
 
 
 def get_ffmpeg_path() -> str:
@@ -566,6 +589,7 @@ class MediaInfo:
     fps: float = 0.0
     rotation: int = 0
     pix_fmt: str = ""
+    color_transfer: str = ""
 
     @property
     def has_geometry(self) -> bool:
@@ -574,6 +598,20 @@ class MediaInfo:
     @property
     def has_alpha(self) -> bool:
         return self.pix_fmt in ALPHA_PIX_FMTS
+
+    @property
+    def is_hdr(self) -> bool:
+        return self.color_transfer in HDR_TRANSFERS
+
+
+def _parse_rate(rate: Optional[str]) -> float:
+    """``"30000/1001"`` -> 29.97; anything unusable or implausible -> 0."""
+    try:
+        num, den = (rate or "0/0").split("/")
+        value = float(num) / float(den) if float(den) else 0.0
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+    return value if 0.0 < value <= MAX_SANE_FPS else 0.0
 
 
 def probe_file(file_path: str) -> MediaInfo:
@@ -593,7 +631,8 @@ def probe_file(file_path: str) -> MediaInfo:
         get_ffprobe_path(), "-v", "error",
         "-read_intervals", "%+#1",
         "-show_entries",
-        "stream=index,codec_type,width,height,r_frame_rate,pix_fmt"
+        "stream=index,codec_type,width,height,r_frame_rate,avg_frame_rate,"
+        "pix_fmt,color_transfer"
         ":frame_side_data=rotation:format=duration",
         "-of", "json", file_path,
     ]
@@ -628,12 +667,12 @@ def probe_file(file_path: str) -> MediaInfo:
             info.width = int(stream.get("width") or 0)
             info.height = int(stream.get("height") or 0)
             info.pix_fmt = stream.get("pix_fmt") or ""
-            rate = stream.get("r_frame_rate") or "0/0"
-            try:
-                num, den = rate.split("/")
-                info.fps = float(num) / float(den) if float(den) else 0.0
-            except (ValueError, ZeroDivisionError):
-                info.fps = 0.0
+            info.color_transfer = stream.get("color_transfer") or ""
+            # avg_frame_rate first: r_frame_rate is the lowest rate that
+            # represents every timestamp, which for a VFR phone clip can be
+            # the container timebase rather than anything near the real rate.
+            info.fps = (_parse_rate(stream.get("avg_frame_rate"))
+                        or _parse_rate(stream.get("r_frame_rate")))
 
     # A quarter turn either way swaps what the filter graph will see.
     if info.rotation % 180 != 0:
@@ -1436,13 +1475,67 @@ def build_spatial_chain(p, plan: GeometryPlan) -> List[str]:
     return build_geometry_steps(p, plan) + build_effect_steps(p)
 
 
+_color_managed_scale: Optional[bool] = None
+
+
+def scale_supports_color_management() -> bool:
+    """Whether this ffmpeg's ``scale`` can convert transfer and primaries.
+
+    Those options arrived with the swscale colour-management work in ffmpeg
+    8. The Homebrew builds have no ``zscale``, so this is the only HDR path;
+    an older ffmpeg (running from source) would reject the whole graph, and
+    skipping the conversion there is the lesser failure.
+    """
+    global _color_managed_scale
+    if _color_managed_scale is None:
+        try:
+            out = subprocess.run(
+                [get_ffmpeg_path(), "-hide_banner", "-h", "filter=scale"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10,
+            ).stdout.decode("utf-8", errors="ignore")
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        _color_managed_scale = "in_transfer" in out and "out_primaries" in out
+    return _color_managed_scale
+
+
+def build_hdr_to_sdr_step(transfer: str) -> str:
+    """One colour-managed ``scale`` from an HDR source to 8-bit BT.709.
+
+    The intent is left at swscale's default, relative colorimetric, on
+    measurement: it puts HDR reference white (HLG 75%, PQ 203 nits) at SDR
+    white (Y ~233 of 235) as BT.2408 prescribes, and clips only the specular
+    highlights above it. ``perceptual`` compresses those highlights in by
+    lowering everything, and left reference white at Y 150-165 — a grey,
+    underexposed picture.
+
+    Input properties are named explicitly rather than read off the frame, so a
+    decoder that drops the side data cannot make this a silent no-op. Matrix
+    and primaries are pinned to BT.2020 rather than copied from the probe: HLG
+    and PQ are defined on BT.2020, and an odd probed value ("unknown",
+    "bt2020c") would make scale reject the whole graph.
+    """
+    return (f"scale=in_color_matrix=bt2020:in_primaries=bt2020"
+            f":in_transfer={transfer}"
+            f":out_color_matrix=bt709:out_primaries=bt709:out_transfer=bt709")
+
+
 def build_video_chain(p: UniqueParams, plan: GeometryPlan, has_overlay: bool,
-                      source_fps: float) -> str:
-    """Assemble the filter_complex video graph."""
+                      source_fps: float, hdr_step: str = "") -> str:
+    """Assemble the filter_complex video graph.
+
+    ``hdr_step`` (see ``build_hdr_to_sdr_step``) converts an HDR source. It
+    runs after the geometry, which ends in the downscale to output size, so
+    the conversion is paid at output resolution rather than 4K; and before the
+    effects, so the colour stage works on the SDR picture it was tuned on.
+    """
     tw, th = p.target_width, p.target_height
 
     steps: List[str] = [f"setpts={round(1 / p.video_speed, 6)}*PTS"]
-    steps += build_spatial_chain(p, plan)
+    if hdr_step:
+        steps += build_geometry_steps(p, plan) + [hdr_step] + build_effect_steps(p)
+    else:
+        steps += build_spatial_chain(p, plan)
     if p.fps_scale != 1.0 and source_fps > 0:
         steps.append(f"fps={round(source_fps * p.fps_scale, 6)}")
 
@@ -1450,10 +1543,13 @@ def build_video_chain(p: UniqueParams, plan: GeometryPlan, has_overlay: bool,
 
     if plan.needs_background:
         # Quarter-resolution blur: 4x cheaper than blurring at full size.
+        # The backdrop comes straight off the source, so an HDR one needs the
+        # same conversion or it would sit washed out around a correct picture.
         bg_w, bg_h = _even(tw // 4), _even(th // 4)
+        bg_hdr = f"{hdr_step}," if hdr_step else ""
         chain = (
             f"[0:v]split=2[bg_src][fg_src];"
-            f"[bg_src]scale={bg_w}:{bg_h},avgblur=sizeX=5:sizeY=5,scale={tw}:{th}[bg];"
+            f"[bg_src]scale={bg_w}:{bg_h},{bg_hdr}avgblur=sizeX=5:sizeY=5,scale={tw}:{th}[bg];"
             f"[fg_src]{fg}[fg];"
             f"[bg][fg]overlay={(tw - plan.fg_w) // 2}:{(th - plan.fg_h) // 2}[base]"
         )
@@ -1648,7 +1744,15 @@ def process_single_video(
     p.pitch = safe_pitch
 
     plan = plan_geometry(info.width, info.height, p)
-    video_chain = build_video_chain(p, plan, has_overlay, info.fps)
+    hdr_step = ""
+    if info.is_hdr:
+        if scale_supports_color_management():
+            hdr_step = build_hdr_to_sdr_step(info.color_transfer)
+        else:
+            log.warning("%s is HDR (%s) but this ffmpeg cannot convert it; "
+                        "colours will be off", os.path.basename(input_path),
+                        info.color_transfer)
+    video_chain = build_video_chain(p, plan, has_overlay, info.fps, hdr_step)
     audio_chain = build_audio_chain(p, info.has_audio, safe_pitch, safe_video_speed)
     filter_complex = f"{video_chain};{audio_chain}"
 
@@ -1681,6 +1785,12 @@ def process_single_video(
                 f":psy-rd={p.psy_rd},0.00:qcomp={p.qcomp}",
             ]
         else:
+            if enc == ENCODER_HEVC_VIDEOTOOLBOX:
+                # The mp4 muxer tags HEVC as hev1 by default, which QuickTime,
+                # Safari and iOS decline to play. hvc1 keeps the parameter
+                # sets in the sample description, where Apple's players want
+                # them — and it is what an iPhone writes.
+                args += ["-tag:v", "hvc1"]
             args += [
                 "-b:v", f"{int(p.video_bitrate_kbps)}k",
                 "-maxrate", f"{int(p.video_bitrate_kbps * 1.6)}k",
@@ -1690,6 +1800,12 @@ def process_single_video(
             ]
         if p.threads > 0:
             args += ["-threads", str(p.threads)]
+        if hdr_step:
+            # The converted frames are BT.709, but the encoder still inherits
+            # the source's bt2020nc matrix tag, and a player would decode the
+            # right pixels with the wrong matrix. Say what the pixels are.
+            args += ["-colorspace", "bt709", "-color_primaries", "bt709",
+                     "-color_trc", "bt709"]
         return args
 
     def _build_cmd(enc: str) -> List[str]:
@@ -1705,7 +1821,7 @@ def process_single_video(
             "-ar", str(p.audio_sample_rate),
             "-shortest",
             "-map_metadata", "-1",
-            "-bsf:v", SEI_STRIP_BSF,
+            "-bsf:v", sei_strip_bsf(enc),
             # bitexact suppresses the "Lavf<ver>" / "Lavc<ver> libx264" writer tags.
             "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact",
         ]

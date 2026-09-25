@@ -133,3 +133,33 @@ def test_image_callbacks(media, tmp_path):
     assert ok == 1, errors
     assert started == [media["photo"]]
     assert results == {media["photo"]: (True, "")}
+
+
+@pytest.mark.parametrize("transfer", ["arib-std-b67", "smpte2084"])
+def test_hdr_source_comes_out_as_sdr_bt709(transfer, tmp_path):
+    """An iPhone clip is HLG; left alone it came out as 8-bit HLG."""
+    if not engine.scale_supports_color_management():
+        pytest.skip("this ffmpeg's scale has no colour management")
+    src = str(tmp_path / "hdr.mp4")
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+         "testsrc2=s=640x360:d=2:r=30", "-vf",
+         "format=yuv420p10le,setparams=color_primaries=bt2020"
+         f":color_trc={transfer}:colorspace=bt2020nc",
+         "-c:v", "libx264", "-preset", "ultrafast", src], check=True)
+    assert engine.probe_file(src).is_hdr
+
+    template = engine.UniqueParams()
+    template.preset = "ultrafast"
+    out = tmp_path / "out"
+    ok, errors = engine.process_batch([src], str(out), params_template=template,
+                                      max_workers=1)
+    assert ok == 1, errors
+    [result] = os.listdir(out)
+    tags = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=color_transfer,color_primaries,color_space", "-of",
+         "default=nw=1", str(out / result)],
+        capture_output=True, text=True, check=True).stdout.split()
+    assert sorted(tags) == ["color_primaries=bt709", "color_space=bt709",
+                            "color_transfer=bt709"]

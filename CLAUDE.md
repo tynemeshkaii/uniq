@@ -50,7 +50,7 @@ Build the `.app`:
 ./build.sh share    # bundle + codesign verify + smoke launch + DMG + sha256 + release notes
 ```
 
-Test suite (pytest, headless Qt via `QT_QPA_PLATFORM=offscreen`; 68 tests, ~6 s). Tests needing ffmpeg are marked `ffmpeg` and skip without it:
+Test suite (pytest, headless Qt via `QT_QPA_PLATFORM=offscreen`; 84 tests, ~9 s). Tests needing ffmpeg are marked `ffmpeg` and skip without it:
 ```bash
 pip3 install -r requirements-dev.txt   # or just use .venv/bin/python
 .venv/bin/python -m pytest
@@ -153,6 +153,12 @@ When measuring this, pin the twin's codec settings. Comparing a
 `compression_level 9` output against a `level 6` twin swings the ratio by more
 than 2x on its own and reads as an effects problem that is not there.
 
+### HDR sources are converted, not passed through
+
+`probe_file` reads `color_transfer`; for HLG (`arib-std-b67`, what iPhones record) or PQ (`smpte2084`) `process_single_video` passes `build_hdr_to_sdr_step` into `build_video_chain`, which puts it between the geometry and the effects (output resolution, and the colour stage sees SDR) and on the backdrop branch. The encoder is then told `bt709` explicitly — it otherwise inherits the source's `bt2020nc` tag. The Homebrew ffmpeg has **no `zscale`**; the conversion is ffmpeg 8's colour-managed `scale` (`in_transfer`/`out_primaries`), gated by `scale_supports_color_management()`. Intent stays relative colorimetric: measured, it maps HDR reference white to SDR white, where `perceptual` left it at Y 150-165.
+
+To make an HDR test clip, tag frames with `setparams=color_trc=...`; ffmpeg 8 ignores the encoder-level `-color_trc`, and a clip made that way is silently SDR.
+
 ### ffmpeg supervision
 
 `process_single_video._run` does not police ffmpeg from its stdout loop, because that loop blocks on ffmpeg's output and a hung ffmpeg never reaches it. A watchdog thread handles Cancel, the stall timeout (`_FFMPEG_STALL_TIMEOUT`: `out_time` not advancing) and the deadline (30x clip duration, at least an hour). A slow encode keeps advancing `out_time`, so do not replace the stall check with a tighter fixed deadline.
@@ -165,7 +171,7 @@ A full output disk returns `DISK_FULL_ERROR`, and both batch functions then stop
 
 ### Anti-fingerprinting
 
-Outputs strip encoder identity: `SEI_STRIP_BSF` removes SEI NAL units; metadata is rewritten from `DEVICE_PROFILES` / `GPS_LOCATIONS` with camera-style fields. `verify_quality.py` asserts no `x264`/`Lavf`/`Lavc` strings survive. Preserve this when touching metadata or encode args.
+Outputs strip encoder identity: `sei_strip_bsf(encoder)` removes SEI NAL units (type 6 in H.264, 39/40 in HEVC — HEVC type 6 is a picture); metadata is rewritten from `DEVICE_PROFILES` / `GPS_LOCATIONS` with camera-style fields. `verify_quality.py` asserts no `x264`/`Lavf`/`Lavc` strings survive. Preserve this when touching metadata or encode args.
 
 Stills go further, because a JPEG's non-pixel surface is bigger than a video's: the JFIF APP0 ffmpeg emits is dropped rather than kept (phone cameras write an Exif APP1 and no JFIF, so carrying both is a tell), the `Software` field carries a plausible per-make build id rather than a bare OS version, and shutter/aperture are written consistently in both their plain and APEX log forms. Note that Meta strips EXIF on upload — this work is for the file as it sits on disk and in whatever passes it around before the upload, not for what survives inside the ad.
 

@@ -181,3 +181,54 @@ def test_changelog_describes_the_current_version():
     with open(cs.CHANGELOG, encoding="utf-8") as f:
         text = f.read()
     assert cs.section(text, DISPLAY_VERSION) or "## Unreleased" in text
+
+
+# ─── Rate limit fallback ─────────────────────────────────
+
+_FEED = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>tag:github.com,2008:Repository/1/v1.0.0-beta.3</id>
+    <link rel="alternate" type="text/html" href="https://github.com/o/r/releases/tag/v1.0.0-beta.3"/>
+    <title>Video Uniqualizer 1.0.0-beta.3</title>
+    <content type="html">&lt;h3&gt;Fixed&lt;/h3&gt;&lt;ul&gt;&lt;li&gt;Dialogs are readable&lt;/li&gt;&lt;/ul&gt;&lt;hr&gt;&lt;pre&gt;build 23&lt;/pre&gt;</content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/1/v1.0.0</id>
+    <link rel="alternate" type="text/html" href="https://github.com/o/r/releases/tag/v1.0.0"/>
+    <title>Video Uniqualizer 1.0.0</title>
+    <content type="html">&lt;p&gt;Final&lt;/p&gt;</content>
+  </entry>
+</feed>"""
+
+
+def test_parse_feed():
+    releases = updates.parse_feed(_FEED)
+    assert [r["tag_name"] for r in releases] == ["v1.0.0-beta.3", "v1.0.0"]
+    assert releases[0]["prerelease"] and not releases[1]["prerelease"]
+    assert releases[0]["body"] == "Fixed\n\n- Dialogs are readable"   # stops at <hr>
+    assert releases[0]["html_url"].endswith("/v1.0.0-beta.3")
+
+
+def test_rate_limited_api_falls_back_to_feed(monkeypatch):
+    calls = []
+
+    def fake_curl(url, accept):
+        calls.append(url)
+        return (403, '{"message": "API rate limit exceeded"}') if "api.github" in url else (200, _FEED)
+
+    monkeypatch.setattr(updates, "_curl", fake_curl)
+    r = updates.newest_update(updates.fetch_releases(), "1.0.0-beta.2", True)
+    assert r.tag == "v1.0.0"
+    assert len(calls) == 2 and calls[1].endswith("releases.atom")
+
+
+def test_other_http_errors_are_reported(monkeypatch):
+    monkeypatch.setattr(updates, "_curl", lambda url, accept: (500, "oops"))
+    with pytest.raises(updates.UpdateCheckError, match="HTTP 500"):
+        updates.fetch_releases()
+
+
+def test_api_notes_drop_the_build_block():
+    body = "### Fixed\n- a\n\n---\n```\nbuild 23\n```"
+    assert updates.tester_notes(body) == "### Fixed\n- a"

@@ -10,6 +10,10 @@ Stills target Meta Ads uploads: the source aspect is preserved (Meta drives plac
 
 ## Commands
 
+**Python environment.** `.venv/` (created by `build.sh`, Python 3.14) has PyQt6, PyInstaller and pytest; the Homebrew `python3` on this Mac has no pytest. Use `.venv/bin/python` for tests and the gate, or activate it first. From source, ffmpeg/ffprobe come from `PATH` (Homebrew); `get_ffmpeg_path()` only looks inside the bundle when frozen.
+
+Modules under `src/` import each other flat (`import engine`, `from version import ...`) — there is no package. Run scripts from `src/` or put it on `sys.path` (`tests/conftest.py` adds `src/` and `tools/`).
+
 Run the app from source (needs `pip3 install -r requirements.txt` + ffmpeg/ffprobe on PATH):
 ```bash
 cd src && python3 main.py
@@ -46,10 +50,10 @@ Build the `.app`:
 ./build.sh share    # bundle + codesign verify + smoke launch + DMG + sha256 + release notes
 ```
 
-Test suite (pytest, headless Qt; ~5 s). Tests needing ffmpeg are marked `ffmpeg` and skip without it:
+Test suite (pytest, headless Qt via `QT_QPA_PLATFORM=offscreen`; 68 tests, ~6 s). Tests needing ffmpeg are marked `ffmpeg` and skip without it:
 ```bash
-pip3 install -r requirements-dev.txt
-python3 -m pytest
+pip3 install -r requirements-dev.txt   # or just use .venv/bin/python
+.venv/bin/python -m pytest
 UPDATE_GOLDEN=1 python3 -m pytest tests/test_pure.py   # after an intended filter-graph change
 ```
 - `tests/test_pure.py` — geometry invariants, sizing, naming, and `tests/golden/video_graph.txt`: a seeded snapshot of the video/audio filter graphs. That snapshot is the "video graph is byte-identical" check the `build_spatial_chain` note below asks for; regenerate it only for an intended change, and review the diff.
@@ -66,7 +70,10 @@ Source layers under `src/`:
 - **`engine.py`** — pure processing core for video. No Qt. Ffmpeg orchestration, randomization, geometry math.
 - **`image_engine.py`** — the still pipeline. Reuses `engine.plan_geometry` and `engine.build_spatial_chain` rather than owning a second copy of the filter graph.
 - **`exif.py`** — EXIF APP1 and PNG `tEXt` writer, by hand, no piexif. ffmpeg's mjpeg encoder discards `-metadata`, so the camera identity is a post-encode pass.
-- **`main.py`** — PyQt6 GUI + `ProcessWorker(QThread)`. The only place engine work is invoked off the UI thread.
+- **`main.py`** — PyQt6 GUI (~2.5k lines): `ParamsPanel` (every control; `build_ranges` / `build_image_ranges`), `MainWindow`, `MediaFileList`, `FolderScanWorker` (off-thread folder walk, capped at `MAX_SCAN_FILES`, skips dotfiles/AppleDouble and `.photoslibrary`-style packages), `ReportDialog`, `UpdateCheckWorker`, and `ProcessWorker(QThread)` — the only place engine work is invoked off the UI thread. `main()` also handles `--benchmark` and `UNIQ_SMOKE_TEST`.
+- **`verify_quality.py`** — the quality gate (see Commands). Thresholds are module constants at the top (`SSIM_DEGRADATION_MIN`, `PHASH_DISTANCE_MIN`, `IMAGE_PHASH_DISTANCE_MIN`, ...); `neutralize_effects` / `neutralize_image_effects` build the clean twin.
+- **`applog.py`** — rotating log, crash marker, `faulthandler`, diagnostics text, report zip. **`updates.py`** — GitHub Releases check via curl. **`version.py`** — `VERSION`, `PRERELEASE`, `DISPLAY_VERSION`, repo/issue URLs, `parse_version`.
+- **`tools/bundle_ffmpeg.py`** (bundle/verify the ffmpeg dylib closure) and **`tools/changelog_section.py`** (prints a version's CHANGELOG section; CI release notes). `docs/superpowers/specs/` holds historical design notes, not current spec.
 - **`settings_store.py`** — QSettings persistence and named presets. Reads state generically off `ParamsPanel`'s attributes (every spin/check/combo, by attribute name), so a new control is persisted with no extra code, and restores through the widgets' setters, so saved values are clamped to the current safety caps. Bump `SCHEMA_VERSION` if a saved value would change meaning.
 - **`fingerprint.py`** — pHash and Haitsma-Kalker audio fingerprints, pure Python, no numpy. Dev-time only; nothing in `main.py` imports it, so it stays out of the bundle.
 - **`styles.py` / `icons.py` / `gen_icns.py`** — skeuomorphic stylesheet, programmatically drawn Qt icons, and the macOS `.icns` generator (build-time).
@@ -83,6 +90,8 @@ Source layers under `src/`:
 - **`process_batch` is concurrent.** A `ThreadPoolExecutor` runs `default_worker_count()` files at once (cores/4, clamped 1-3, since x264 does not scale past a few cores), and splits x264 threads across jobs. Progress callbacks are the mean across active jobs, so per-file progress is not monotonic. Shared counters are under `state_lock`; keep new batch state there.
 - **`build_spatial_chain` is the shared half**, and it is itself `build_geometry_steps` + `build_effect_steps`. It is every filter that is a function of one frame plus the resolved geometry, and both pipelines call it — video wraps it in `setpts`/`fps`, images use it alone. The two halves are separately addressable because a still with an alpha channel has to run geometry on both the colour and the alpha branch while running effects on the colour branch only. A still passes `warp_drift_period=0`, which is what makes the corner-drift term collapse to a static `eval=init` perspective, and `scale_flags="lanczos"`, which video does not set so it keeps `bicubic`. **Refactoring this function means re-checking the video graph is byte-identical**, not just that the gate passes.
 - **`ImageParams` is duck-typed against that chain.** `plan_geometry` and `build_spatial_chain` read fields off it by name, so renaming a field in either dataclass silently changes the other pipeline's filter graph.
+- **Stills mirror this with their own types:** `ImageRanges` → fresh `ImageParams` per file in `process_image_batch`, with `_STATIC_IMAGE_FIELDS` (`output_format`, `max_long_side`, `fake_meta`) as the copied list — same rule, a new container setting goes there. Inputs: `IMAGE_EXTENSIONS`; HEIC/HEIF/AVIF are `UNSUPPORTED_IMAGE_EXTENSIONS` (listed, then rejected with a message, not decoded).
+- **Mixed batches run in two phases.** `ProcessWorker.run` does all stills first, then videos, as separate pools. The single "Parallel Jobs" value is a *video* worker count; `image_workers_for` rescales it onto the still scale (default = cores, max 8) rather than passing it through — passing it literally throttled stills ~2x. Overall progress weights a still at `_IMAGE_WEIGHT` (0.05) of a video.
 - **`performance_profile`** (`quality` / `balanced` / `fast_mac`) and `encoder` (`libx264` / `h264_videotoolbox` / `hevc_videotoolbox`) both alter encode args. The UI's profile combo rewrites CRF/preset/encoder widgets in `_apply_performance_profile`, so profile changes reach the engine through those widgets, not as a separate path.
 
 ### Measure before adding a filter
@@ -164,11 +173,12 @@ Stills go further, because a JPEG's non-pixel surface is bigger than a video's: 
 
 - `VideoUniqualizer.spec` is the single source for bundle contents, excludes and Info.plist; `build.sh` runs it and only supplies computed values (`UNIQ_BUILD_NUMBER` = git commit count, `UNIQ_MIN_MACOS`).
 - **The bundled ffmpeg must be self-contained.** A Homebrew ffmpeg is a stub over `/opt/homebrew/Cellar/*/lib`; copied alone it works on the build Mac and fails on every other one, and a plain smoke launch cannot tell. `tools/bundle_ffmpeg.py bundle` copies the dylib closure into `ffmpeg_bin/lib` relinked to `@loader_path`; the spec passes ffmpeg/ffprobe as `binaries`, so PyInstaller moves those libs into `Contents/Frameworks` under `@rpath`. `build.sh` then checks twice: `bundle_ffmpeg.py verify --boundary <app>` (every dependency resolves inside the app) and a run under `DYLD_PRINT_LIBRARIES` (dyld loads nothing from outside). Do not weaken either.
+- **Prefer CI builds for testers.** The floor comes from the Homebrew bottles on the build machine: the `macos-15` runner produces a macOS 15+ app, a Mac on a newer OS produces a newer floor (26 at the time of writing). The CI release is the widest-compatible build.
 - `LSMinimumSystemVersion` is the highest `minos` among the bundled ffmpeg Mach-Os. Homebrew bottles target the OS they were built on, so that is the real floor for testers; lowering it needs an ffmpeg built with a lower deployment target, not a plist edit.
 - The version lives only in `src/version.py`. `./build.sh share` refuses a dirty tree (`ALLOW_DIRTY=1` overrides for throwaway builds).
 - Third-party licenses: `bundle_ffmpeg.py` copies each keg's license files and writes `THIRD_PARTY_NOTICES.txt` into `ffmpeg_bin/licenses`, shipped as `Contents/Resources/licenses` (Help → Third-Party Licenses). The Homebrew ffmpeg is `--enable-gpl --enable-version3`, so distributing the app means distributing GPLv3 binaries; `build.sh` fails if the notices are missing.
 - **Feedback loop.** `applog.start_session()` arms `faulthandler` (fatal-signal stack traces to `crash.log`) and a `session.lock` marker removed by `atexit`; a marker found at launch means the last session crashed or was force-quit, and the app offers **Help → Report a Problem**, which zips description, settings, crash log and (opt-in) app logs to the Desktop. Nothing is uploaded. `UNIQ_SMOKE_TEST=1` (set by `build.sh`'s smoke launch, which is killed) skips the marker and the first-launch prompts — keep it that way or every build leaves the builder a false crash prompt.
-- **Updates.** `updates.py` reads this repo's public GitHub Releases via `/usr/bin/curl` (the frozen app has no CA bundle for Python's SSL). Pre-release testers are offered newer pre-releases; the daily check runs only after the tester agreed once.
+- **Updates.** `updates.py` reads this repo's public GitHub Releases via `/usr/bin/curl` (the frozen app has no CA bundle for Python's SSL), falling back to `releases.atom` when the anonymous API limit (60/h per IP) answers 403/429. Pre-release testers are offered newer pre-releases; the daily check runs only after the tester agreed once.
 - **Releasing.** Bump `src/version.py`, rename CHANGELOG's *Unreleased* to the version, commit, then push the tag **on its own** (`git push origin vX`) — GitHub did not start the tag workflow when the tag went up in the same push as the branch. CI checks tag = version and that the CHANGELOG section exists, builds, and publishes a GitHub release (pre-release for hyphenated tags) with the DMG.
 - **Developer ID / notarization** is wired but unverified (no certificate on the build Mac): `DEVELOPER_ID="Developer ID Application: … (TEAMID)" NOTARY_PROFILE=<keychain profile> ./build.sh share` signs inside-out with the hardened runtime and `packaging/entitlements.plist`, then notarizes and staples the DMG. Test a first launch on a clean Mac before relying on it.
 - `src/applog.py` writes `~/Library/Logs/Video Uniqualizer/app.log` (rotating). The engines log ffmpeg failures with the full command and stderr tail; the UI only shows 500 characters. Help → Copy Diagnostics is what testers paste into bug reports.

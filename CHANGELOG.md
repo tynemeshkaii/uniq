@@ -6,6 +6,13 @@ numbers match the app's Help → About and the git tags.
 When cutting a release, rename **Unreleased** to the new version; the CI
 release job publishes that section as the GitHub release notes.
 
+## Unreleased
+
+### Fixed
+- Check for Updates failed with "HTTP 403" when GitHub's hourly limit for
+  anonymous requests was used up (common behind shared office or VPN
+  addresses). It now falls back to the release feed, which has no such limit.
+
 ## 1.0.0-beta.3 — 2026-09-25
 
 ### Added

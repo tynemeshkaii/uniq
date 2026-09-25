@@ -16,6 +16,7 @@ DISPLAY_VERSION = f"{VERSION}-{PRERELEASE}" if PRERELEASE else VERSION
 REPOSITORY = "tynemeshkaii/uniq"
 ISSUES_URL = f"https://github.com/{REPOSITORY}/issues/new"
 RELEASES_API = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=20"
+RELEASES_FEED = f"https://github.com/{REPOSITORY}/releases.atom"
 
 
 def parse_version(text: str):

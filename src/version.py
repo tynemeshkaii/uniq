@@ -6,7 +6,7 @@ the pre-release tag is kept separate and only joined for display.
 """
 
 VERSION = "1.0.0"
-PRERELEASE = "beta.2"   # empty string for a final release
+PRERELEASE = "beta.3"   # empty string for a final release
 
 DISPLAY_VERSION = f"{VERSION}-{PRERELEASE}" if PRERELEASE else VERSION
 

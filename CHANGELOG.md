@@ -6,7 +6,7 @@ numbers match the app's Help → About and the git tags.
 When cutting a release, rename **Unreleased** to the new version; the CI
 release job publishes that section as the GitHub release notes.
 
-## Unreleased
+## 1.0.0-beta.3 — 2026-09-25
 
 ### Added
 - **Help → Report a Problem…** writes a report zip to the Desktop (description,
@@ -20,6 +20,10 @@ release job publishes that section as the GitHub release notes.
 
 ### Changed
 - Tester guide covers reporting problems and getting new betas.
+
+### Fixed
+- Dialogs (the end-of-batch summary, errors, the preset name prompt) showed
+  light grey text on a light background and were hard to read.
 
 ## 1.0.0-beta.2 — 2026-09-25
 

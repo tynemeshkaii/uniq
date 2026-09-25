@@ -5,6 +5,8 @@ Main window with skeuomorphic design.
 
 import sys
 import os
+import logging
+import subprocess
 import traceback
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -13,62 +15,136 @@ from PyQt6.QtWidgets import (
     QComboBox, QTabWidget, QScrollArea, QFrame, QSizePolicy,
     QAbstractItemView, QGridLayout, QMessageBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, QUrl, QMimeData
-from PyQt6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import Qt, QThread, QObject, QTimer, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, QUrl, QMimeData
+from PyQt6.QtGui import QAction, QCloseEvent, QIcon, QFont, QDragEnterEvent, QDropEvent
 
 from engine import (
     ENCODER_H264_VIDEOTOOLBOX,
     ENCODER_LABELS,
     ENCODER_LIBX264,
+    MAX_AUDIO_DELAY_MS,
+    MAX_HUE_DEGREES,
+    MAX_ROTATE_DEGREES,
     PERFORMANCE_PROFILE_BALANCED,
     PERFORMANCE_PROFILE_FAST_MAC,
     PERFORMANCE_PROFILE_LABELS,
     PERFORMANCE_PROFILE_QUALITY,
+    SPEECH_SAFE_PITCH_MAX,
+    SPEECH_SAFE_PITCH_MIN,
+    SPEECH_SAFE_VIDEO_SPEED_MAX,
+    SPEECH_SAFE_VIDEO_SPEED_MIN,
+    RandomRanges,
     UniqueParams,
     available_video_encoders,
     benchmark_video_encoders,
     check_ffmpeg_available,
+    default_worker_count,
+    ffmpeg_version_line,
+    get_ffmpeg_path,
     process_batch,
+)
+from image_engine import (
+    IMAGE_EXTENSIONS,
+    JPEG_QUALITY_CEILING,
+    JPEG_QUALITY_FLOOR,
+    MAX_IMAGE_NOISE,
+    MAX_IMAGE_ROTATE_DEGREES,
+    MAX_IMAGE_UNSHARP,
+    MAX_IMAGE_VIGNETTE,
+    UNSUPPORTED_IMAGE_EXTENSIONS,
+    ImageParams,
+    ImageRanges,
+    image_workers_for,
+    is_image_file,
+    is_unsupported_image,
+    process_image_batch,
 )
 from icons import (
     app_icon, file_select_icon, output_folder_icon,
     process_icon, settings_icon, remove_icon
 )
 from styles import MAIN_STYLESHEET
+import applog
+from version import DISPLAY_VERSION
+
+log = logging.getLogger("app")
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
+# Unsupported stills are accepted into the list on purpose: routing them to the
+# image pipeline produces a message naming the format, whereas silently
+# ignoring the drop looks like the app is broken.
+MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS | UNSUPPORTED_IMAGE_EXTENSIONS
+
+
+def _is_still(path: str) -> bool:
+    return is_image_file(path) or is_unsupported_image(path)
+
+
+class _ErrorRelay(QObject):
+    """Carries an error message from any thread to a dialog on the GUI thread.
+
+    Qt must only show widgets from the GUI thread. A signal emitted elsewhere
+    is queued to the thread the relay lives in, so the dialog still appears
+    for an exception raised inside a worker.
+    """
+    show = pyqtSignal(str)
+
+
+_error_relay = None
+
+
+def _show_error_dialog(message: str):
+    path = applog.log_path()
+    where = f"The details are in the log:\n{path}" if path else \
+        "The log file could not be opened, so details went to stderr."
+    try:
+        QMessageBox.critical(
+            None, "Unexpected Error",
+            f"An unexpected error occurred:\n\n{message}\n\n{where}\n\n"
+            "Help → Copy Diagnostics puts everything needed for a bug report "
+            "on the clipboard.")
+    except Exception:
+        pass
 
 
 def _install_exception_hook():
-    """Show a dialog on unhandled exceptions instead of silent crash."""
+    """Log unhandled exceptions and show a dialog instead of a silent crash."""
     def _handler(exc_type, exc_value, exc_tb):
-        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-        print(tb_text, file=sys.stderr)
-        try:
-            QMessageBox.critical(
-                None,
-                "Unexpected Error",
-                f"An unexpected error occurred:\n\n{exc_value}\n\n"
-                f"Details have been printed to stderr.",
-            )
-        except Exception:
-            pass
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        log.error("unhandled exception",
+                  exc_info=(exc_type, exc_value, exc_tb))
+        app = QApplication.instance()
+        if app is None:
+            return
+        if QThread.currentThread() is app.thread():
+            _show_error_dialog(str(exc_value))
+        elif _error_relay is not None:
+            _error_relay.show.emit(str(exc_value))
     sys.excepthook = _handler
 
 
 # ─── Worker Thread ──────────────────────────────────────
 
 class ProcessWorker(QThread):
-    progress = pyqtSignal(int, int, str)   # current, total, filename
-    file_progress = pyqtSignal(float)      # 0.0–1.0 within current file
-    finished = pyqtSignal(int, bool, list)  # success_count, was_cancelled, errors
+    progress = pyqtSignal(int, int, str)   # completed, total, filename
+    file_progress = pyqtSignal(float)      # 0.0–1.0, mean across active jobs
+    # Deliberately not named `finished` — that would shadow QThread.finished,
+    # which Qt uses internally for thread teardown.
+    job_finished = pyqtSignal(int, bool, list)  # success_count, was_cancelled, errors
     error = pyqtSignal(str)
 
-    def __init__(self, files, output_folder, params, parent=None):
+    def __init__(self, files, output_folder, params, ranges, workers=0,
+                 image_params=None, image_ranges=None, parent=None):
         super().__init__(parent)
         self.files = files
         self.output_folder = output_folder
         self.params = params
+        self.ranges = ranges
+        self.workers = workers
+        self.image_params = image_params
+        self.image_ranges = image_ranges
         self._cancelled = False
 
     def cancel(self):
@@ -78,25 +154,75 @@ class ProcessWorker(QThread):
         return self._cancelled
 
     def run(self):
+        """Stills first, then video.
+
+        The two pipelines want different concurrency — a still is not x264 and
+        scales with cores, while video jobs have to split a fixed thread budget
+        — so they run as separate phases rather than sharing one pool, and the
+        one "Parallel Jobs" number is translated onto the still scale by
+        ``image_workers_for`` rather than passed through. Stills finish in well
+        under a second each, so putting them first also means the progress bar
+        starts moving immediately on a mixed batch.
+        """
+        images = [f for f in self.files if _is_still(f)]
+        videos = [f for f in self.files if not _is_still(f)]
+        total = len(self.files)
+        errors = []
+        count = 0
+        log.info("batch start: %d videos, %d images -> %s (workers=%s, "
+                 "encoder=%s, profile=%s, preset=%s, crf=%s, %dx%d)",
+                 len(videos), len(images), self.output_folder, self.workers,
+                 self.params.encoder, self.params.performance_profile,
+                 self.params.preset, self.params.crf,
+                 self.params.target_width, self.params.target_height)
+
         try:
-            count, errors = process_batch(
-                input_files=self.files,
-                output_folder=self.output_folder,
-                params_template=self.params,
-                randomize_each=True,
-                progress_callback=lambda cur, tot, fn: self.progress.emit(cur, tot, fn),
-                file_progress_callback=lambda pct: self.file_progress.emit(pct),
-                cancelled=self.is_cancelled,
-            )
-            self.finished.emit(count, self._cancelled, errors)
+            if images:
+                done_images, image_errors = process_image_batch(
+                    input_files=images,
+                    output_folder=self.output_folder,
+                    params_template=self.image_params,
+                    ranges=self.image_ranges,
+                    progress_callback=lambda cur, tot, fn: (
+                        self.progress.emit(cur, total, fn),
+                        self.file_progress.emit(cur / tot if tot else 1.0),
+                    ),
+                    cancelled=self.is_cancelled,
+                    max_workers=image_workers_for(self.workers),
+                )
+                count += done_images
+                errors += image_errors
+
+            if videos and not self._cancelled:
+                offset = len(images)
+                done_videos, video_errors = process_batch(
+                    input_files=videos,
+                    output_folder=self.output_folder,
+                    params_template=self.params,
+                    ranges=self.ranges,
+                    randomize_each=True,
+                    progress_callback=lambda cur, tot, fn: self.progress.emit(
+                        offset + cur, total, fn),
+                    file_progress_callback=lambda pct: self.file_progress.emit(pct),
+                    cancelled=self.is_cancelled,
+                    max_workers=self.workers,
+                )
+                count += done_videos
+                errors += video_errors
+
+            log.info("batch %s: %d/%d ok, %d errors",
+                     "cancelled" if self._cancelled else "done",
+                     count, total, len(errors))
+            self.job_finished.emit(count, self._cancelled, errors)
         except Exception as e:
+            log.exception("batch aborted")
             self.error.emit(str(e))
 
 
 # ─── Drag & Drop File List ──────────────────────────────
 
-class VideoFileList(QListWidget):
-    """QListWidget that accepts video file drops from Finder."""
+class MediaFileList(QListWidget):
+    """QListWidget that accepts video and image drops from Finder."""
     files_dropped = pyqtSignal(list)
 
     def __init__(self, parent=None):
@@ -127,13 +253,13 @@ class VideoFileList(QListWidget):
                 continue
             if os.path.isfile(path):
                 ext = os.path.splitext(path)[1].lower()
-                if ext in VIDEO_EXTENSIONS:
+                if ext in MEDIA_EXTENSIONS:
                     paths.append(path)
             elif os.path.isdir(path):
                 for root, _, files in os.walk(path):
                     for f in files:
                         ext = os.path.splitext(f)[1].lower()
-                        if ext in VIDEO_EXTENSIONS:
+                        if ext in MEDIA_EXTENSIONS:
                             paths.append(os.path.join(root, f))
         if paths:
             self.files_dropped.emit(paths)
@@ -199,6 +325,7 @@ class ParamsPanel(QWidget):
         tabs.addTab(self._build_geometry_tab(), "Geometry")
         tabs.addTab(self._build_color_tab(), "Color")
         tabs.addTab(self._build_effects_tab(), "Effects")
+        tabs.addTab(self._build_images_tab(), "Images")
         tabs.addTab(self._build_output_tab(), "Output")
         main_layout.addWidget(tabs)
 
@@ -207,29 +334,47 @@ class ParamsPanel(QWidget):
         layout = QVBoxLayout(w)
         layout.setSpacing(8)
 
+        zoom_hint = ("Reframing is by far the strongest lever on a perceptual "
+                     "hash — measured, it beats every filter in this app. It "
+                     "costs sharpness rather than cleanliness, because the crop "
+                     "is scaled back up to the output size. On smooth footage "
+                     "the hash only clears a matcher's threshold above 1.14.")
+
         self.spin_zoom_min = QDoubleSpinBox()
-        self.spin_zoom_min.setRange(1.0, 1.2)
+        self.spin_zoom_min.setRange(1.0, 1.3)
         self.spin_zoom_min.setDecimals(3)
         self.spin_zoom_min.setSingleStep(0.005)
-        layout.addLayout(make_param_row("Zoom Min:", self.spin_zoom_min, "Minimum random zoom factor"))
+        layout.addLayout(make_param_row("Zoom Min:", self.spin_zoom_min, zoom_hint))
 
         self.spin_zoom_max = QDoubleSpinBox()
-        self.spin_zoom_max.setRange(1.0, 1.2)
+        self.spin_zoom_max.setRange(1.0, 1.3)
         self.spin_zoom_max.setDecimals(3)
         self.spin_zoom_max.setSingleStep(0.005)
-        layout.addLayout(make_param_row("Zoom Max:", self.spin_zoom_max, "Maximum random zoom factor"))
+        layout.addLayout(make_param_row("Zoom Max:", self.spin_zoom_max, zoom_hint))
 
         self.spin_rotate_max = QDoubleSpinBox()
-        self.spin_rotate_max.setRange(0.0, 5.0)
+        self.spin_rotate_max.setRange(0.0, MAX_ROTATE_DEGREES)
         self.spin_rotate_max.setDecimals(2)
-        self.spin_rotate_max.setSingleStep(0.1)
-        layout.addLayout(make_param_row("Rotate Max (°):", self.spin_rotate_max, "Max rotation angle in degrees (+/-)"))
+        self.spin_rotate_max.setSingleStep(0.05)
+        layout.addLayout(make_param_row(
+            "Rotate Max (°):", self.spin_rotate_max,
+            "Max rotation angle in degrees (+/-). Rotated corners are cropped away, "
+            "so a larger angle costs more of the frame."))
 
         self.spin_k1_max = QDoubleSpinBox()
         self.spin_k1_max.setRange(0.0, 0.05)
         self.spin_k1_max.setDecimals(4)
         self.spin_k1_max.setSingleStep(0.001)
         layout.addLayout(make_param_row("Lens K1 Max:", self.spin_k1_max, "Max barrel/pincushion distortion (+/-)"))
+
+        self.spin_pan_max = QDoubleSpinBox()
+        self.spin_pan_max.setRange(0.0, 1.0)
+        self.spin_pan_max.setDecimals(2)
+        self.spin_pan_max.setSingleStep(0.05)
+        layout.addLayout(make_param_row(
+            "Pan Max:", self.spin_pan_max,
+            "How far the zoomed crop window drifts off-centre, as a fraction of "
+            "the slack zoom frees up. Never reaches the rotated corners."))
 
         self.spin_crop_min = QSpinBox()
         self.spin_crop_min.setRange(0, 40)
@@ -239,8 +384,27 @@ class ParamsPanel(QWidget):
         self.spin_crop_max.setRange(0, 40)
         layout.addLayout(make_param_row("Crop Margin Max (px):", self.spin_crop_max, "Max micro-crop pixels"))
 
-        self.chk_subpixel = QCheckBox("Sub-pixel shift (invisible, resamples all pixels)")
-        layout.addWidget(self.chk_subpixel)
+        self.chk_micro_warp = QCheckBox("Micro-warp (invisible, non-uniform sub-pixel resample)")
+        self.chk_micro_warp.setToolTip(
+            "Shifts the four corners by 0–3 px. Unlike rotation or scaling, the "
+            "displacement varies across the frame, which is what perceptual "
+            "hashes are least tolerant of.")
+        layout.addWidget(self.chk_micro_warp)
+
+        self.chk_warp_drift = QCheckBox("Micro-warp drift (invisible, varies the warp over time)")
+        self.chk_warp_drift.setToolTip(
+            "Each corner eases to a second inset over many hundreds of frames — "
+            "about 0.01 px per frame, far below what reads as motion. A static "
+            "warp is one transform for a matcher to solve; a drifting one leaves "
+            "no single transform that aligns the clip end to end.")
+        layout.addWidget(self.chk_warp_drift)
+
+        self.chk_hflip = QCheckBox("Mirror horizontally (strongest, but VISIBLE)")
+        self.chk_hflip.setToolTip(
+            "Defeats most perceptual hashes outright at no quality cost — but it "
+            "mirrors any on-screen text, logos and faces. Leave off unless the "
+            "footage has no readable content.")
+        layout.addWidget(self.chk_hflip)
 
         self.spin_trim_start_max = QDoubleSpinBox()
         self.spin_trim_start_max.setRange(0.0, 3.0)
@@ -299,13 +463,24 @@ class ParamsPanel(QWidget):
         layout.addLayout(make_param_row("Brightness Max:", self.spin_bright_max, "Max brightness shift (+/-)"))
 
         self.spin_hue_max = QDoubleSpinBox()
-        self.spin_hue_max.setRange(0.0, 30.0)
+        self.spin_hue_max.setRange(0.0, MAX_HUE_DEGREES)
         self.spin_hue_max.setDecimals(1)
-        self.spin_hue_max.setSingleStep(1.0)
-        layout.addLayout(make_param_row("Hue Shift Max (°):", self.spin_hue_max, "Max hue rotation (+/-)"))
+        self.spin_hue_max.setSingleStep(0.5)
+        layout.addLayout(make_param_row(
+            "Hue Shift Max (°):", self.spin_hue_max,
+            "Max hue rotation (+/-). Past roughly 5° the drift shows on skin "
+            "tones and brand colours."))
 
         self.chk_gamma = QCheckBox("Gamma micro-shift (invisible, breaks perceptual hash)")
         layout.addWidget(self.chk_gamma)
+
+        self.chk_tone_curve = QCheckBox("Tone curve (invisible, resists colour normalisation)")
+        self.chk_tone_curve.setToolTip(
+            "Folds the colour shift and the gamma bend into one monotonic spline "
+            "per channel, replacing two filters with one. A matcher that undoes a "
+            "colour grade fits a gain or a gamma; an arbitrary spline is neither, "
+            "so the fit leaves a residue behind.")
+        layout.addWidget(self.chk_tone_curve)
 
         layout.addStretch()
         return w
@@ -348,45 +523,213 @@ class ParamsPanel(QWidget):
         layout.addLayout(make_param_row("Vignette Max:", self.spin_vignette_max))
 
         self.spin_speed_min = QDoubleSpinBox()
-        self.spin_speed_min.setRange(0.8, 1.0)
+        self.spin_speed_min.setRange(SPEECH_SAFE_VIDEO_SPEED_MIN, 1.0)
         self.spin_speed_min.setDecimals(4)
         self.spin_speed_min.setSingleStep(0.005)
         layout.addLayout(make_param_row("Video Speed Min:", self.spin_speed_min))
 
         self.spin_speed_max = QDoubleSpinBox()
-        self.spin_speed_max.setRange(1.0, 1.2)
+        self.spin_speed_max.setRange(1.0, SPEECH_SAFE_VIDEO_SPEED_MAX)
         self.spin_speed_max.setDecimals(4)
         self.spin_speed_max.setSingleStep(0.005)
         layout.addLayout(make_param_row("Video Speed Max:", self.spin_speed_max))
 
         self.spin_pitch_min = QDoubleSpinBox()
-        self.spin_pitch_min.setRange(0.8, 1.0)
+        self.spin_pitch_min.setRange(SPEECH_SAFE_PITCH_MIN, 1.0)
         self.spin_pitch_min.setDecimals(4)
         self.spin_pitch_min.setSingleStep(0.005)
         layout.addLayout(make_param_row("Audio Pitch Min:", self.spin_pitch_min))
 
         self.spin_pitch_max = QDoubleSpinBox()
-        self.spin_pitch_max.setRange(1.0, 1.2)
+        self.spin_pitch_max.setRange(1.0, SPEECH_SAFE_PITCH_MAX)
         self.spin_pitch_max.setDecimals(4)
         self.spin_pitch_max.setSingleStep(0.005)
         layout.addLayout(make_param_row("Audio Pitch Max:", self.spin_pitch_max))
 
         self.spin_adelay_min = QSpinBox()
-        self.spin_adelay_min.setRange(0, 500)
-        layout.addLayout(make_param_row("Audio Delay Min (ms):", self.spin_adelay_min))
+        self.spin_adelay_min.setRange(0, MAX_AUDIO_DELAY_MS)
+        layout.addLayout(make_param_row(
+            "Audio Delay Min (ms):", self.spin_adelay_min,
+            "Audio is shifted against the picture, so this is capped at "
+            f"{MAX_AUDIO_DELAY_MS} ms — lip-sync error becomes noticeable around 45 ms."))
 
         self.spin_adelay_max = QSpinBox()
-        self.spin_adelay_max.setRange(0, 500)
+        self.spin_adelay_max.setRange(0, MAX_AUDIO_DELAY_MS)
         layout.addLayout(make_param_row("Audio Delay Max (ms):", self.spin_adelay_max))
+
+        self.chk_fps_jitter = QCheckBox("Frame rate jitter (invisible, rewrites every timestamp)")
+        self.chk_fps_jitter.setToolTip(
+            "Retimes to within 0.1% of the source rate — one duplicated or "
+            "dropped frame roughly every 30 seconds.")
+        layout.addWidget(self.chk_fps_jitter)
 
         self.chk_audio_eq = QCheckBox("Inaudible frequency EQ (breaks audio fingerprint)")
         layout.addWidget(self.chk_audio_eq)
+
+        self.chk_audio_notch = QCheckBox("Spectral notches (inaudible, moves audio fingerprint peaks)")
+        self.chk_audio_notch.setToolTip(
+            "Five narrow cuts under 1.5 dB. Audio fingerprints key off spectral "
+            "peak positions, which a broad EQ leaves intact.")
+        layout.addWidget(self.chk_audio_notch)
+
+        self.chk_audio_tilt = QCheckBox("Broadband spectral tilt (inaudible, shifts band energies)")
+        self.chk_audio_tilt.setToolTip(
+            "A shelf under 1 dB at each end of the spectrum. Fingerprints that "
+            "bin energy into wide log bands barely notice a narrow notch but do "
+            "read a tilt across the whole range.")
+        layout.addWidget(self.chk_audio_tilt)
+
+        self.chk_audio_noise_floor = QCheckBox("Added noise floor (inaudible, sits under room tone)")
+        self.chk_audio_noise_floor.setToolTip(
+            "Pink noise around -65 dBFS, independent per channel. Well below "
+            "the noise floor of any real recording, so it cannot be heard.")
+        layout.addWidget(self.chk_audio_noise_floor)
 
         self.chk_audio_resample = QCheckBox("Audio sample rate round-trip (invisible, resamples all audio)")
         layout.addWidget(self.chk_audio_resample)
 
         self.chk_chroma_roundtrip = QCheckBox("Chroma subsampling round-trip (invisible, changes all color values)")
         layout.addWidget(self.chk_chroma_roundtrip)
+
+        layout.addStretch()
+        return w
+
+    def _build_images_tab(self):
+        """Controls whose safe bounds differ between stills and video.
+
+        Colour and the sub-perceptual toggles are shared with the video tabs —
+        the same grade is no more visible on a photo than in motion — but grain,
+        sharpening, vignette and rotation get their own controls here, because a
+        still is examined rather than watched and their caps are lower.
+        """
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setSpacing(8)
+
+        note = QLabel(
+            "Stills reuse the Color tab and the sub-perceptual toggles.\n"
+            "The settings below are the ones whose safe limits are lower on a\n"
+            "photo than on video, plus the JPEG/PNG output settings."
+        )
+        note.setStyleSheet("color: #888;")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.chk_img_full_frame = QCheckBox(
+            "Keep the full frame (never crop — disables all reframing)")
+        self.chk_img_full_frame.setToolTip(
+            "Keeps every source pixel: no zoom crop, no crop margin, no pan, "
+            "and no rotation, lens distortion or micro-warp, since those leave "
+            "uncovered corners that only a crop can hide.\n\n"
+            "Reframing is the only stage measured to move a still's perceptual "
+            "hash, so with this on the output is perceptually near-identical to "
+            "the source. Colour, grain, the encode, the output size and the "
+            "fabricated metadata still vary per file.")
+        self.chk_img_full_frame.toggled.connect(self._sync_image_geometry_enabled)
+        layout.addWidget(self.chk_img_full_frame)
+
+        self.spin_img_zoom_min = QDoubleSpinBox()
+        self.spin_img_zoom_min.setRange(1.0, 1.4)
+        self.spin_img_zoom_min.setDecimals(3)
+        self.spin_img_zoom_min.setSingleStep(0.005)
+        layout.addLayout(make_param_row(
+            "Image Zoom Min:", self.spin_img_zoom_min,
+            "Reframing is the strongest lever on a perceptual hash. On a still "
+            "it is also a permanent resolution loss, since the crop is scaled "
+            "back up — check the result at 1:1 before raising it."))
+
+        self.spin_img_zoom_max = QDoubleSpinBox()
+        self.spin_img_zoom_max.setRange(1.0, 1.4)
+        self.spin_img_zoom_max.setDecimals(3)
+        self.spin_img_zoom_max.setSingleStep(0.005)
+        layout.addLayout(make_param_row("Image Zoom Max:", self.spin_img_zoom_max))
+
+        self.spin_img_rotate_max = QDoubleSpinBox()
+        self.spin_img_rotate_max.setRange(0.0, MAX_IMAGE_ROTATE_DEGREES)
+        self.spin_img_rotate_max.setDecimals(2)
+        self.spin_img_rotate_max.setSingleStep(0.05)
+        layout.addLayout(make_param_row(
+            "Image Rotate Max (°):", self.spin_img_rotate_max,
+            f"Capped at {MAX_IMAGE_ROTATE_DEGREES}° — a tilted horizon is "
+            "obvious on a photo in a way it is not mid-motion."))
+
+        layout.addWidget(make_separator())
+
+        self.spin_img_noise_min = QSpinBox()
+        self.spin_img_noise_min.setRange(0, MAX_IMAGE_NOISE)
+        layout.addLayout(make_param_row(
+            "Image Grain Min:", self.spin_img_noise_min,
+            f"Capped at {MAX_IMAGE_NOISE}. Nothing averages grain away on a "
+            "still and the viewer can zoom, so the video range is visible here."))
+
+        self.spin_img_noise_max = QSpinBox()
+        self.spin_img_noise_max.setRange(0, MAX_IMAGE_NOISE)
+        layout.addLayout(make_param_row("Image Grain Max:", self.spin_img_noise_max))
+
+        self.spin_img_unsharp_min = QDoubleSpinBox()
+        self.spin_img_unsharp_min.setRange(-MAX_IMAGE_UNSHARP, MAX_IMAGE_UNSHARP)
+        self.spin_img_unsharp_min.setDecimals(2)
+        self.spin_img_unsharp_min.setSingleStep(0.05)
+        layout.addLayout(make_param_row("Image Sharpen Min:", self.spin_img_unsharp_min))
+
+        self.spin_img_unsharp_max = QDoubleSpinBox()
+        self.spin_img_unsharp_max.setRange(-MAX_IMAGE_UNSHARP, MAX_IMAGE_UNSHARP)
+        self.spin_img_unsharp_max.setDecimals(2)
+        self.spin_img_unsharp_max.setSingleStep(0.05)
+        layout.addLayout(make_param_row("Image Sharpen Max:", self.spin_img_unsharp_max))
+
+        self.spin_img_vignette_min = QDoubleSpinBox()
+        self.spin_img_vignette_min.setRange(0.0, MAX_IMAGE_VIGNETTE)
+        self.spin_img_vignette_min.setDecimals(2)
+        self.spin_img_vignette_min.setSingleStep(0.01)
+        layout.addLayout(make_param_row("Image Vignette Min:", self.spin_img_vignette_min))
+
+        self.spin_img_vignette_max = QDoubleSpinBox()
+        self.spin_img_vignette_max.setRange(0.0, MAX_IMAGE_VIGNETTE)
+        self.spin_img_vignette_max.setDecimals(2)
+        self.spin_img_vignette_max.setSingleStep(0.01)
+        layout.addLayout(make_param_row("Image Vignette Max:", self.spin_img_vignette_max))
+
+        layout.addWidget(make_separator())
+
+        self.combo_image_format = QComboBox()
+        self.combo_image_format.addItem("Match source (JPEG in → JPEG out)", "auto")
+        self.combo_image_format.addItem("Always JPEG", "jpeg")
+        self.combo_image_format.addItem("Always PNG", "png")
+        layout.addLayout(make_param_row(
+            "Output Format:", self.combo_image_format,
+            "PNG is kept lossless because flattening a graphic to JPEG rings "
+            "on every hard edge. WEBP has no encoder in the bundled ffmpeg and "
+            "always leaves as JPEG."))
+
+        self.spin_jpeg_q_min = QSpinBox()
+        self.spin_jpeg_q_min.setRange(JPEG_QUALITY_FLOOR, JPEG_QUALITY_CEILING)
+        layout.addLayout(make_param_row(
+            "JPEG Quality Min:", self.spin_jpeg_q_min,
+            "ffmpeg's -q:v scale: 2 is near-lossless, higher is worse. Meta "
+            "re-encodes on upload, so the extra bytes below about 6 are thrown "
+            "away by their transcode anyway."))
+
+        self.spin_jpeg_q_max = QSpinBox()
+        self.spin_jpeg_q_max.setRange(JPEG_QUALITY_FLOOR, JPEG_QUALITY_CEILING)
+        layout.addLayout(make_param_row("JPEG Quality Max:", self.spin_jpeg_q_max))
+
+        self.spin_max_long_side = QSpinBox()
+        self.spin_max_long_side.setRange(0, 8000)
+        self.spin_max_long_side.setSingleStep(64)
+        self.spin_max_long_side.setSpecialValueText("Keep source size")
+        layout.addLayout(make_param_row(
+            "Max Long Side (px):", self.spin_max_long_side,
+            "0 keeps the source resolution. Meta downscales above 1936 px on "
+            "the long edge, so capping here only saves upload bytes."))
+
+        self.chk_img_size_jitter = QCheckBox(
+            "Jitter output dimensions (breaks exact-size grouping, invisible)")
+        layout.addWidget(self.chk_img_size_jitter)
+
+        self.chk_img_huffman = QCheckBox(
+            "Randomize JPEG entropy coding (different bytes, identical pixels)")
+        layout.addWidget(self.chk_img_huffman)
 
         layout.addStretch()
         return w
@@ -442,6 +785,16 @@ class ParamsPanel(QWidget):
         self.combo_preset = QComboBox()
         self.combo_preset.addItems(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"])
         layout.addLayout(make_param_row("Encoding Preset:", self.combo_preset))
+
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setRange(1, 8)
+        layout.addLayout(make_param_row(
+            "Parallel Jobs:", self.spin_workers,
+            "How many videos encode at once. Each job gets a share of the CPU "
+            "threads, so more jobs mostly helps on short clips.\n\n"
+            "Images are far cheaper than a video encode and keep scaling to "
+            "about one job per core, so a still batch reads this as the same "
+            "position on its own scale, not the same number of files."))
 
         self.chk_fake_meta = QCheckBox("Write fake camera metadata (EXIF)")
         layout.addWidget(self.chk_fake_meta)
@@ -504,59 +857,102 @@ class ParamsPanel(QWidget):
         self.overlay_path_label.setToolTip("")
 
     def load_defaults(self):
-        """Load the V9.0 script defaults."""
-        self.spin_zoom_min.setValue(1.02)
-        self.spin_zoom_max.setValue(1.05)
-        self.spin_rotate_max.setValue(0.7)
-        self.spin_k1_max.setValue(0.008)
-        self.spin_crop_min.setValue(4)
-        self.spin_crop_max.setValue(16)
+        """Load the perceptually safe operating point (see RandomRanges)."""
+        d = RandomRanges()
 
-        self.spin_trim_start_max.setValue(0.6)
-        self.spin_trim_end_max.setValue(0.5)
+        self.spin_zoom_min.setValue(d.zoom[0])
+        self.spin_zoom_max.setValue(d.zoom[1])
+        self.spin_rotate_max.setValue(d.rotate_max)
+        self.spin_k1_max.setValue(d.k1_max)
+        self.spin_pan_max.setValue(d.pan_max)
+        self.spin_crop_min.setValue(d.crop_margin[0])
+        self.spin_crop_max.setValue(d.crop_margin[1])
 
-        self.spin_color_shift.setValue(0.10)
-        self.spin_contrast_min.setValue(0.93)
-        self.spin_contrast_max.setValue(1.07)
-        self.spin_sat_min.setValue(0.88)
-        self.spin_sat_max.setValue(1.12)
-        self.spin_bright_max.setValue(0.04)
-        self.spin_hue_max.setValue(6.0)
+        self.spin_trim_start_max.setValue(d.trim_start[1])
+        self.spin_trim_end_max.setValue(d.trim_end[1])
 
-        self.spin_noise_min.setValue(4)
-        self.spin_noise_max.setValue(12)
-        self.spin_unsharp_min.setValue(-0.4)
-        self.spin_unsharp_max.setValue(0.6)
-        self.spin_vignette_min.setValue(0.05)
-        self.spin_vignette_max.setValue(0.25)
-        self.spin_speed_min.setValue(0.97)
-        self.spin_speed_max.setValue(1.08)
-        self.spin_pitch_min.setValue(0.96)
-        self.spin_pitch_max.setValue(1.04)
-        self.spin_adelay_min.setValue(30)
-        self.spin_adelay_max.setValue(200)
+        self.spin_color_shift.setValue(d.color_shift_max)
+        self.spin_contrast_min.setValue(d.contrast[0])
+        self.spin_contrast_max.setValue(d.contrast[1])
+        self.spin_sat_min.setValue(d.saturation[0])
+        self.spin_sat_max.setValue(d.saturation[1])
+        self.spin_bright_max.setValue(d.brightness_max)
+        self.spin_hue_max.setValue(d.hue_max)
+
+        self.spin_noise_min.setValue(d.noise[0])
+        self.spin_noise_max.setValue(d.noise[1])
+        self.spin_unsharp_min.setValue(d.unsharp[0])
+        self.spin_unsharp_max.setValue(d.unsharp[1])
+        self.spin_vignette_min.setValue(d.vignette[0])
+        self.spin_vignette_max.setValue(d.vignette[1])
+        self.spin_speed_min.setValue(d.video_speed[0])
+        self.spin_speed_max.setValue(d.video_speed[1])
+        self.spin_pitch_min.setValue(d.pitch[0])
+        self.spin_pitch_max.setValue(d.pitch[1])
+        self.spin_adelay_min.setValue(d.adelay_ms[0])
+        self.spin_adelay_max.setValue(d.adelay_ms[1])
 
         self.spin_width.setValue(1080)
         self.spin_height.setValue(1920)
         self.spin_crf.setValue(24)
-        self.spin_gop_min.setValue(30)
-        self.spin_gop_max.setValue(90)
+        self.spin_gop_min.setValue(d.gop[0])
+        self.spin_gop_max.setValue(d.gop[1])
         self.combo_preset.setCurrentText("fast")
         self.combo_performance.setCurrentIndex(self.combo_performance.findData(PERFORMANCE_PROFILE_QUALITY))
         self.combo_encoder.setCurrentIndex(self.combo_encoder.findData(ENCODER_LIBX264))
         self.spin_video_bitrate.setValue(8000)
+        self.spin_workers.setValue(default_worker_count())
         self.chk_fake_meta.setChecked(True)
-        self.chk_subpixel.setChecked(True)
-        self.chk_gamma.setChecked(True)
-        self.chk_audio_eq.setChecked(True)
-        self.chk_audio_resample.setChecked(True)
-        self.chk_chroma_roundtrip.setChecked(True)
-        self.chk_x264_tuning.setChecked(True)
+        self.chk_micro_warp.setChecked(d.use_micro_warp)
+        self.chk_warp_drift.setChecked(d.use_warp_drift)
+        self.chk_tone_curve.setChecked(d.use_tone_curve)
+        self.chk_audio_tilt.setChecked(d.use_audio_tilt)
+        self.chk_audio_noise_floor.setChecked(d.use_audio_noise_floor)
+        self.chk_hflip.setChecked(d.use_hflip)
+        self.chk_gamma.setChecked(d.use_gamma)
+        self.chk_fps_jitter.setChecked(d.use_fps_jitter)
+        self.chk_audio_eq.setChecked(d.use_audio_eq)
+        self.chk_audio_notch.setChecked(d.use_audio_notch)
+        self.chk_audio_resample.setChecked(d.use_audio_resample)
+        self.chk_chroma_roundtrip.setChecked(d.use_chroma_roundtrip)
+        self.chk_x264_tuning.setChecked(d.use_x264_tuning)
 
-        self.spin_ov_opacity_min.setValue(0.04)
-        self.spin_ov_opacity_max.setValue(0.11)
+        self.spin_ov_opacity_min.setValue(d.ov_opacity[0])
+        self.spin_ov_opacity_max.setValue(d.ov_opacity[1])
         self._overlay_file = ""
         self.overlay_path_label.setText("No overlay selected")
+
+        di = ImageRanges()
+        self.chk_img_full_frame.setChecked(di.preserve_full_frame)
+        self._sync_image_geometry_enabled()
+        self.spin_img_zoom_min.setValue(di.zoom[0])
+        self.spin_img_zoom_max.setValue(di.zoom[1])
+        self.spin_img_rotate_max.setValue(di.rotate_max)
+        self.spin_img_noise_min.setValue(di.noise[0])
+        self.spin_img_noise_max.setValue(di.noise[1])
+        self.spin_img_unsharp_min.setValue(di.unsharp[0])
+        self.spin_img_unsharp_max.setValue(di.unsharp[1])
+        self.spin_img_vignette_min.setValue(di.vignette[0])
+        self.spin_img_vignette_max.setValue(di.vignette[1])
+        self.spin_jpeg_q_min.setValue(di.jpeg_quality[0])
+        self.spin_jpeg_q_max.setValue(di.jpeg_quality[1])
+        self.spin_max_long_side.setValue(di.max_long_side)
+        self.combo_image_format.setCurrentIndex(
+            self.combo_image_format.findData("auto"))
+        self.chk_img_size_jitter.setChecked(True)
+        self.chk_img_huffman.setChecked(di.use_jpeg_huffman_jitter)
+
+    def _sync_image_geometry_enabled(self):
+        """Grey out the still reframing controls while full-frame output is on.
+
+        They are not merely ignored in that mode — the engine holds zoom,
+        rotation, lens distortion, the micro-warp, the crop margin and the pan
+        at identity — so leaving them live would misreport what runs.
+        """
+        enabled = not self.chk_img_full_frame.isChecked()
+        for widget in (self.spin_img_zoom_min, self.spin_img_zoom_max,
+                       self.spin_img_rotate_max):
+            widget.setEnabled(enabled)
 
     def _apply_performance_profile(self):
         profile = self.combo_performance.currentData()
@@ -579,96 +975,115 @@ class ParamsPanel(QWidget):
             self.combo_preset.setCurrentText("fast")
             self.spin_video_bitrate.setValue(8000)
 
+    def build_ranges(self) -> RandomRanges:
+        """Collect the randomization spec. The engine redraws it for every file.
+
+        Previously the panel drew one concrete value per run and the engine
+        discarded most of it, so these controls had no effect on the output.
+        """
+        return RandomRanges(
+            zoom=_safe_range(self.spin_zoom_min.value(), self.spin_zoom_max.value()),
+            rotate_max=self.spin_rotate_max.value(),
+            k1_max=self.spin_k1_max.value(),
+            crop_margin=_safe_range(self.spin_crop_min.value(), self.spin_crop_max.value()),
+            pan_max=self.spin_pan_max.value(),
+            trim_start=(0.1, max(0.1, self.spin_trim_start_max.value())),
+            trim_end=(0.1, max(0.1, self.spin_trim_end_max.value())),
+
+            color_shift_max=self.spin_color_shift.value(),
+            contrast=_safe_range(self.spin_contrast_min.value(), self.spin_contrast_max.value()),
+            saturation=_safe_range(self.spin_sat_min.value(), self.spin_sat_max.value()),
+            brightness_max=self.spin_bright_max.value(),
+            hue_max=self.spin_hue_max.value(),
+
+            noise=_safe_range(self.spin_noise_min.value(), self.spin_noise_max.value()),
+            unsharp=_safe_range(self.spin_unsharp_min.value(), self.spin_unsharp_max.value()),
+            vignette=_safe_range(self.spin_vignette_min.value(), self.spin_vignette_max.value()),
+
+            video_speed=_safe_range(self.spin_speed_min.value(), self.spin_speed_max.value()),
+            pitch=_safe_range(self.spin_pitch_min.value(), self.spin_pitch_max.value()),
+            adelay_ms=_safe_range(self.spin_adelay_min.value(), self.spin_adelay_max.value()),
+            gop=_safe_range(self.spin_gop_min.value(), self.spin_gop_max.value()),
+
+            ov_opacity=_safe_range(self.spin_ov_opacity_min.value(), self.spin_ov_opacity_max.value()),
+
+            use_gamma=self.chk_gamma.isChecked(),
+            use_micro_warp=self.chk_micro_warp.isChecked(),
+            use_warp_drift=self.chk_warp_drift.isChecked(),
+            use_tone_curve=self.chk_tone_curve.isChecked(),
+            use_audio_tilt=self.chk_audio_tilt.isChecked(),
+            use_audio_noise_floor=self.chk_audio_noise_floor.isChecked(),
+            use_chroma_roundtrip=self.chk_chroma_roundtrip.isChecked(),
+            use_audio_eq=self.chk_audio_eq.isChecked(),
+            use_audio_notch=self.chk_audio_notch.isChecked(),
+            use_audio_resample=self.chk_audio_resample.isChecked(),
+            use_x264_tuning=self.chk_x264_tuning.isChecked(),
+            use_fps_jitter=self.chk_fps_jitter.isChecked(),
+            use_hflip=self.chk_hflip.isChecked(),
+        )
+
     def build_params(self) -> UniqueParams:
-        """Build a UniqueParams template from current UI values."""
-        import random
-        from engine import clamp
-
+        """Build the static template: output settings that must not be randomized."""
         p = UniqueParams()
-        p.k1 = round(random.uniform(-self.spin_k1_max.value(), self.spin_k1_max.value()), 4)
-        p.rotate = round(random.uniform(-self.spin_rotate_max.value(), self.spin_rotate_max.value()), 3)
-
-        lo, hi = _safe_range(self.spin_zoom_min.value(), self.spin_zoom_max.value())
-        p.zoom = round(random.uniform(lo, hi), 3)
-
-        lo, hi = _safe_range(self.spin_crop_min.value(), self.spin_crop_max.value())
-        p.crop_margin = random.randint(int(lo), int(hi))
-
-        cs = self.spin_color_shift.value()
-        p.rs = round(random.uniform(-cs, cs), 3)
-        p.gs = round(random.uniform(-cs, cs), 3)
-        p.bs = round(random.uniform(-cs, cs), 3)
-
-        lo, hi = _safe_range(self.spin_contrast_min.value(), self.spin_contrast_max.value())
-        p.contrast = round(random.uniform(lo, hi), 3)
-
-        lo, hi = _safe_range(self.spin_sat_min.value(), self.spin_sat_max.value())
-        p.saturation = round(random.uniform(lo, hi), 3)
-
-        p.brightness = round(random.uniform(-self.spin_bright_max.value(), self.spin_bright_max.value()), 3)
-        p.hue_shift = round(random.uniform(-self.spin_hue_max.value(), self.spin_hue_max.value()), 1)
-
-        lo, hi = _safe_range(self.spin_unsharp_min.value(), self.spin_unsharp_max.value())
-        p.unsharp_amount = round(random.uniform(lo, hi), 2)
-
-        lo, hi = _safe_range(self.spin_noise_min.value(), self.spin_noise_max.value())
-        p.noise_strength = random.randint(int(lo), int(hi))
-        p.noise_flags = random.choice(["t", "u", "t+u"])
-
-        lo, hi = _safe_range(self.spin_vignette_min.value(), self.spin_vignette_max.value())
-        p.vignette_angle = round(random.uniform(lo, hi), 2)
-
-        if self.chk_gamma.isChecked():
-            p.gamma = round(random.uniform(0.98, 1.02), 3)
-        if self.chk_subpixel.isChecked():
-            p.subpixel_x = round(random.uniform(0.3, 0.7), 2)
-            p.subpixel_y = round(random.uniform(0.3, 0.7), 2)
-
-        lo, hi = _safe_range(self.spin_speed_min.value(), self.spin_speed_max.value())
-        p.video_speed = round(random.uniform(lo, hi), 4)
-
-        p.trim_start = round(random.uniform(0.1, self.spin_trim_start_max.value()), 2)
-        p.trim_end = round(random.uniform(0.1, self.spin_trim_end_max.value()), 2)
-
-        lo, hi = _safe_range(self.spin_pitch_min.value(), self.spin_pitch_max.value())
-        p.pitch = clamp(round(random.uniform(lo, hi), 4), 0.9, 1.1)
-
-        lo, hi = _safe_range(self.spin_adelay_min.value(), self.spin_adelay_max.value())
-        p.adelay_ms = random.randint(int(lo), int(hi))
-
-        if self.chk_audio_eq.isChecked():
-            p.audio_highpass = random.randint(25, 45)
-            p.audio_lowpass = random.randint(16000, 18000)
-
-        p.do_audio_resample = self.chk_audio_resample.isChecked()
-        p.do_chroma_roundtrip = self.chk_chroma_roundtrip.isChecked()
-
-        if self.chk_x264_tuning.isChecked():
-            p.deblock_alpha = random.randint(-3, 3)
-            p.deblock_beta = random.randint(-3, 3)
-            p.aq_strength = round(random.uniform(0.8, 1.2), 2)
-            p.psy_rd = round(random.uniform(0.8, 1.2), 2)
-            p.qcomp = round(random.uniform(0.5, 0.7), 2)
-
         p.overlay_file = self._overlay_file
-
-        lo, hi = _safe_range(self.spin_ov_opacity_min.value(), self.spin_ov_opacity_max.value())
-        p.opacity = round(random.uniform(lo, hi), 2)
-        p.ov_speed = round(random.uniform(0.88, 1.12), 2)
-
         p.target_width = self.spin_width.value()
         p.target_height = self.spin_height.value()
         p.crf = self.spin_crf.value()
+        p.preset = self.combo_preset.currentText()
         p.performance_profile = self.combo_performance.currentData() or PERFORMANCE_PROFILE_BALANCED
         p.encoder = self.combo_encoder.currentData() or ENCODER_LIBX264
         p.video_bitrate_kbps = self.spin_video_bitrate.value()
-
-        lo, hi = _safe_range(self.spin_gop_min.value(), self.spin_gop_max.value())
-        p.gop_size = random.randint(int(lo), int(hi))
-        p.preset = self.combo_preset.currentText()
         p.fake_meta = self.chk_fake_meta.isChecked()
-
         return p
+
+    def build_image_ranges(self) -> ImageRanges:
+        """The still spec.
+
+        Colour and the sub-perceptual toggles come from the shared tabs; only
+        the controls whose safe bounds differ come from the Images tab.
+        """
+        return ImageRanges(
+            zoom=_safe_range(self.spin_img_zoom_min.value(), self.spin_img_zoom_max.value()),
+            rotate_max=self.spin_img_rotate_max.value(),
+            k1_max=self.spin_k1_max.value(),
+            crop_margin=_safe_range(self.spin_crop_min.value(), self.spin_crop_max.value()),
+            pan_max=self.spin_pan_max.value(),
+
+            color_shift_max=self.spin_color_shift.value(),
+            contrast=_safe_range(self.spin_contrast_min.value(), self.spin_contrast_max.value()),
+            saturation=_safe_range(self.spin_sat_min.value(), self.spin_sat_max.value()),
+            brightness_max=self.spin_bright_max.value(),
+            hue_max=self.spin_hue_max.value(),
+
+            noise=_safe_range(self.spin_img_noise_min.value(), self.spin_img_noise_max.value()),
+            unsharp=_safe_range(self.spin_img_unsharp_min.value(), self.spin_img_unsharp_max.value()),
+            vignette=_safe_range(self.spin_img_vignette_min.value(), self.spin_img_vignette_max.value()),
+
+            jpeg_quality=_safe_range(self.spin_jpeg_q_min.value(), self.spin_jpeg_q_max.value()),
+            size_jitter=((0.985, 1.0) if self.chk_img_size_jitter.isChecked()
+                         else (1.0, 1.0)),
+            max_long_side=self.spin_max_long_side.value(),
+
+            preserve_full_frame=self.chk_img_full_frame.isChecked(),
+            use_gamma=self.chk_gamma.isChecked(),
+            use_micro_warp=self.chk_micro_warp.isChecked(),
+            use_tone_curve=self.chk_tone_curve.isChecked(),
+            use_chroma_roundtrip=self.chk_chroma_roundtrip.isChecked(),
+            use_jpeg_huffman_jitter=self.chk_img_huffman.isChecked(),
+            use_hflip=self.chk_hflip.isChecked(),
+            fake_meta=self.chk_fake_meta.isChecked(),
+        )
+
+    def build_image_params(self) -> ImageParams:
+        """The still template: output settings that must not be randomized."""
+        p = ImageParams()
+        p.output_format = self.combo_image_format.currentData() or "auto"
+        p.max_long_side = self.spin_max_long_side.value()
+        p.fake_meta = self.chk_fake_meta.isChecked()
+        return p
+
+    def worker_count(self) -> int:
+        return self.spin_workers.value()
 
 
 # ─── Main Window ────────────────────────────────────────
@@ -690,6 +1105,9 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.input_files = []
         self.output_folder = ""
+        # Set when the user quits mid-batch: the window closes itself once the
+        # worker has stopped, and the end-of-batch dialogs are skipped.
+        self._quit_after_worker = False
         self._current_file_index = 0
         self._current_file_total = 0
 
@@ -724,6 +1142,83 @@ class MainWindow(QMainWindow):
         root.addWidget(scroll, 1)
 
         self._update_button_states()
+        self._build_menu()
+
+    def _build_menu(self):
+        help_menu = self.menuBar().addMenu("Help")
+
+        act_log = QAction("Show Log in Finder", self)
+        act_log.triggered.connect(self._show_log)
+        help_menu.addAction(act_log)
+
+        act_diag = QAction("Copy Diagnostics", self)
+        act_diag.triggered.connect(self._copy_diagnostics)
+        help_menu.addAction(act_diag)
+
+        # macOS moves an action with this role into the application menu.
+        act_about = QAction("About Video Uniqualizer", self)
+        act_about.setMenuRole(QAction.MenuRole.AboutRole)
+        act_about.triggered.connect(self._show_about)
+        help_menu.addAction(act_about)
+
+    def _show_log(self):
+        path = applog.log_path()
+        if not path or not os.path.exists(path):
+            QMessageBox.information(
+                self, "No Log File",
+                "The log file could not be created, so there is nothing to show.")
+            return
+        subprocess.run(["open", "-R", path], check=False)
+
+    def _copy_diagnostics(self):
+        text = applog.diagnostics(get_ffmpeg_path(), ffmpeg_version_line())
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(
+            self, "Diagnostics Copied",
+            "Version, system, ffmpeg and the recent log are on the clipboard. "
+            "Paste them into your bug report.\n\n"
+            "The log contains the names and folders of files you processed.")
+
+    def _show_about(self):
+        QMessageBox.about(
+            self, "About Video Uniqualizer",
+            f"Video Uniqualizer {DISPLAY_VERSION}\n\n{applog.system_summary()}\n"
+            f"{ffmpeg_version_line()}")
+
+    def closeEvent(self, event: QCloseEvent):
+        """Stop a running batch before the window goes away.
+
+        Letting the window close mid-batch destroys the QThread while it runs,
+        which aborts the process, and leaves ffmpeg children writing
+        half-finished files. Instead the batch is cancelled — the engine kills
+        ffmpeg and deletes partial outputs — and the window closes itself when
+        the worker reports back.
+        """
+        if self.worker is None or not self.worker.isRunning():
+            event.accept()
+            return
+        event.ignore()
+        if self._quit_after_worker:
+            return  # already stopping; a second Cmd+Q must not re-prompt
+        answer = QMessageBox.question(
+            self, "Processing Is Running",
+            "Stop processing and quit?\n\n"
+            "Files that are already finished are kept; the ones in progress "
+            "are deleted.",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        log.info("quit requested during batch; cancelling")
+        self._quit_after_worker = True
+        self._cancel_processing()
+
+    def _close_if_quitting(self) -> bool:
+        if not self._quit_after_worker:
+            return False
+        QTimer.singleShot(0, self.close)
+        return True
 
     def _build_top_bar(self) -> QWidget:
         bar = QWidget()
@@ -743,7 +1238,7 @@ class MainWindow(QMainWindow):
         t1 = QLabel("Video Uniqualizer")
         t1.setObjectName("appTitle")
         titles.addWidget(t1)
-        t2 = QLabel("HYBRID V9.0 GOD MODE — MAXIMUM UNIQUE")
+        t2 = QLabel(f"Version {DISPLAY_VERSION}")
         t2.setObjectName("appSubtitle")
         titles.addWidget(t2)
         lay.addLayout(titles)
@@ -786,15 +1281,24 @@ class MainWindow(QMainWindow):
         layout.addLayout(input_header)
 
         # File list with drag & drop
-        self.file_list = VideoFileList()
+        self.file_list = MediaFileList()
         self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.file_list.setMinimumHeight(120)
         self.file_list.setMaximumHeight(200)
         self.file_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.file_list.files_dropped.connect(self._add_files)
+        # A drag-reorder rewrites the model behind our back; processing order and
+        # `input_files` have to follow it.
+        self.file_list.model().rowsMoved.connect(
+            lambda *_: self._sync_files_from_list())
+        self.file_list.model().rowsRemoved.connect(
+            lambda *_: self._sync_files_from_list())
+        self.file_list.model().rowsInserted.connect(
+            lambda *_: self._sync_files_from_list())
         layout.addWidget(self.file_list)
 
-        self.file_count_label = QLabel("No files selected — drag & drop video files here")
+        self.file_count_label = QLabel(
+            "No files selected — drag & drop videos or images here")
         self.file_count_label.setObjectName("statusLabel")
         layout.addWidget(self.file_count_label)
 
@@ -878,47 +1382,76 @@ class MainWindow(QMainWindow):
 
     def _add_files(self, paths: list):
         """Add files from drag-drop or file dialog, deduplicating."""
+        existing = set(self.input_files)
         for p in paths:
-            if p not in self.input_files:
-                self.input_files.append(p)
-                item = QListWidgetItem(os.path.basename(p))
-                item.setToolTip(p)
-                self.file_list.addItem(item)
+            if p in existing:
+                continue
+            existing.add(p)
+            item = QListWidgetItem(os.path.basename(p))
+            item.setToolTip(p)
+            # The path lives on the item, not in a parallel list indexed by row:
+            # the list is InternalMove, so rows reorder without the model ever
+            # telling `input_files` about it.
+            item.setData(Qt.ItemDataRole.UserRole, p)
+            self.file_list.addItem(item)
+        self._sync_files_from_list()
+
+    def _sync_files_from_list(self):
+        """Rebuild ``input_files`` from the widget — the widget is the truth."""
+        paths = []
+        for row in range(self.file_list.count()):
+            item = self.file_list.item(row)
+            path = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if path:
+                paths.append(path)
+        self.input_files = paths
         self._update_file_count()
+        self._refresh_output_label()
         self._update_button_states()
 
     def _select_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select Video Files",
+            "Select Video or Image Files",
             "",
-            "Video Files (*.mp4 *.mov *.avi *.mkv *.webm *.flv *.wmv);;All Files (*)"
+            "Media Files (*.mp4 *.mov *.avi *.mkv *.webm *.flv *.wmv "
+            "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff);;"
+            "Video Files (*.mp4 *.mov *.avi *.mkv *.webm *.flv *.wmv);;"
+            "Image Files (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff);;"
+            "All Files (*)"
         )
         if paths:
             self._add_files(paths)
 
     def _remove_selected(self):
-        for item in reversed(self.file_list.selectedItems()):
-            row = self.file_list.row(item)
-            self.file_list.takeItem(row)
-            if row < len(self.input_files):
-                self.input_files.pop(row)
-        self._update_file_count()
-        self._update_button_states()
+        for item in self.file_list.selectedItems():
+            self.file_list.takeItem(self.file_list.row(item))
+        self._sync_files_from_list()
 
     def _clear_files(self):
         self.file_list.clear()
-        self.input_files.clear()
-        self._update_file_count()
-        self._update_button_states()
+        self._sync_files_from_list()
 
     def _select_output(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if folder:
             self.output_folder = folder
-            self.output_label.setText(folder)
             self.output_label.setToolTip(folder)
+            self._refresh_output_label()
             self._update_button_states()
+
+    def _refresh_output_label(self):
+        # The file list is wired up before this label exists, and its signals can
+        # fire during that window.
+        if not hasattr(self, "output_label"):
+            return
+        if not self.output_folder:
+            self.output_label.setText("No folder selected")
+            return
+        text = self.output_folder
+        if self._output_folder_holds_inputs():
+            text += "  ⚠︎ also an input folder — outputs land next to sources"
+        self.output_label.setText(text)
 
     def _reset_params(self):
         self.params_panel.load_defaults()
@@ -926,9 +1459,19 @@ class MainWindow(QMainWindow):
     def _update_file_count(self):
         n = len(self.input_files)
         if n == 0:
-            self.file_count_label.setText("No files selected — drag & drop video files here")
+            self.file_count_label.setText(
+                "No files selected — drag & drop videos or images here")
         else:
-            self.file_count_label.setText(f"{n} file{'s' if n != 1 else ''} selected")
+            stills = sum(1 for f in self.input_files if _is_still(f))
+            if stills and stills != n:
+                self.file_count_label.setText(
+                    f"{n} files selected ({n - stills} video, {stills} image)")
+            elif stills:
+                self.file_count_label.setText(
+                    f"{n} image{'s' if n != 1 else ''} selected")
+            else:
+                self.file_count_label.setText(
+                    f"{n} video{'s' if n != 1 else ''} selected")
 
     def _update_button_states(self):
         can_start = len(self.input_files) > 0 and bool(self.output_folder)
@@ -940,19 +1483,61 @@ class MainWindow(QMainWindow):
             self.worker.wait(5000)
             self.worker = None
 
+    def _output_folder_holds_inputs(self) -> bool:
+        """True when outputs would land in a folder a source file came from.
+
+        That folder is what the user drags in next time, so the outputs get
+        re-uniqualized as if they were sources — a second generation loss, and a
+        batch where some files are two passes deep.
+        """
+        if not self.output_folder:
+            return False
+        try:
+            out = os.path.realpath(self.output_folder)
+        except OSError:
+            return False
+        for f in self.input_files:
+            try:
+                if os.path.realpath(os.path.dirname(f)) == out:
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _confirm_output_folder(self) -> bool:
+        if not self._output_folder_holds_inputs():
+            return True
+        answer = QMessageBox.warning(
+            self,
+            "Output Folder Is Also an Input Folder",
+            "The output folder already holds some of the input files.\n\n"
+            "New files land next to their sources, so the next batch you drag "
+            "in from this folder will re-process the output of this one.\n\n"
+            "Process anyway?",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def _start_processing(self):
         if not self.input_files or not self.output_folder:
             return
 
-        params = self.params_panel.build_params()
+        if not self._confirm_output_folder():
+            return
+
         self.worker = ProcessWorker(
             files=list(self.input_files),
             output_folder=self.output_folder,
-            params=params,
+            params=self.params_panel.build_params(),
+            ranges=self.params_panel.build_ranges(),
+            workers=self.params_panel.worker_count(),
+            image_params=self.params_panel.build_image_params(),
+            image_ranges=self.params_panel.build_image_ranges(),
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.file_progress.connect(self._on_file_progress)
-        self.worker.finished.connect(self._on_finished)
+        self.worker.job_finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
 
         self._current_file_index = 0
@@ -974,14 +1559,14 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Cancelling (waiting for ffmpeg to stop)...")
             self.btn_cancel.setEnabled(False)
 
-    def _on_progress(self, current, total, filename):
+    def _on_progress(self, completed, total, filename):
         if total > 0:
-            pct = int((current / total) * 100)
+            pct = int((completed / total) * 100)
             self.progress_bar.setValue(pct)
-            self.progress_bar.setFormat(f"{current}/{total} — {filename}")
-            self.status_label.setText(f"Processing: {filename}")
-            self._current_file_index = current
-            self.file_progress_bar.setValue(0)
+            self.progress_bar.setFormat(f"{completed}/{total} done")
+            if filename:
+                self.status_label.setText(f"Finished: {filename}")
+            self._current_file_index = completed
 
     def _on_file_progress(self, fraction):
         self.file_progress_bar.setValue(int(fraction * 1000))
@@ -996,6 +1581,8 @@ class MainWindow(QMainWindow):
         self.file_progress_bar.setVisible(False)
         self._cleanup_worker()
         self._update_button_states()
+        if self._close_if_quitting():
+            return
 
         if was_cancelled:
             pct = int((success_count / total) * 100) if total > 0 else 0
@@ -1012,6 +1599,7 @@ class MainWindow(QMainWindow):
                 msg += f"\n\nErrors ({len(errors)}):\n" + "\n".join(errors[:10])
                 if len(errors) > 10:
                     msg += f"\n... and {len(errors) - 10} more"
+                msg += "\n\nFull details are in the log (Help → Show Log in Finder)."
 
             QMessageBox.information(self, "Processing Complete", msg)
 
@@ -1024,14 +1612,36 @@ class MainWindow(QMainWindow):
         self.file_progress_bar.setVisible(False)
         self._cleanup_worker()
         self._update_button_states()
+        if self._close_if_quitting():
+            return
 
-        QMessageBox.critical(self, "Error", f"Processing failed:\n{error_msg}")
+        QMessageBox.critical(
+            self, "Error",
+            f"Processing failed:\n{error_msg}\n\n"
+            "Help → Copy Diagnostics collects the details for a bug report.")
 
 
 # ─── Entry Point ────────────────────────────────────────
 
+def _ffmpeg_missing_text(err: str) -> str:
+    if getattr(sys, "frozen", False):
+        # The bundle ships its own ffmpeg; telling a tester to install one
+        # would send them after the wrong problem.
+        fix = ("The ffmpeg bundled inside the app failed to start. This is a "
+               "build problem, not something to fix on this Mac — please "
+               "report it together with the log.")
+    else:
+        fix = "Install ffmpeg: brew install ffmpeg"
+    path = applog.log_path()
+    where = f"\n\nLog: {path}" if path else ""
+    return f"Video Uniqualizer cannot process files.\n\n{err}\n\n{fix}{where}"
+
+
 def main():
+    applog.setup_logging()
     _install_exception_hook()
+    log.info("start: %s", applog.system_summary())
+    log.info("ffmpeg: %s — %s", get_ffmpeg_path(), ffmpeg_version_line())
 
     if "--benchmark" in sys.argv:
         ok, err = check_ffmpeg_available()
@@ -1051,23 +1661,26 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Video Uniqualizer")
     app.setApplicationDisplayName("Video Uniqualizer")
+    app.setApplicationVersion(DISPLAY_VERSION)
     app.setStyleSheet(MAIN_STYLESHEET)
     app.setWindowIcon(app_icon(512))
 
+    global _error_relay
+    _error_relay = _ErrorRelay()
+    _error_relay.show.connect(_show_error_dialog)
+
     ok, err = check_ffmpeg_available()
     if not ok:
-        QMessageBox.critical(
-            None,
-            "ffmpeg Not Found",
-            f"Video Uniqualizer requires ffmpeg to work.\n\n{err}\n\n"
-            f"Install ffmpeg: brew install ffmpeg",
-        )
+        log.error("ffmpeg check failed: %s", err)
+        QMessageBox.critical(None, "ffmpeg Unavailable", _ffmpeg_missing_text(err))
         sys.exit(1)
 
     window = MainWindow()
     window.show()
 
-    sys.exit(app.exec())
+    code = app.exec()
+    log.info("exit (%s)", code)
+    sys.exit(code)
 
 
 if __name__ == "__main__":

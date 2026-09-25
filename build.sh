@@ -27,6 +27,15 @@ RELEASE_NOTES_PATH="$DIST_DIR/RELEASE_NOTES.txt"
 TESTING_GUIDE_PATH="$DIST_DIR/TESTING_ON_MAC.md"
 SMOKE_LOG="$BUILD_DIR/smoke-test.log"
 HOST_ARCH="$(uname -m)"
+BUNDLE_TOOL="$SCRIPT_DIR/tools/bundle_ffmpeg.py"
+APP_VERSION="$(cd "$SRC_DIR" && python3 -c 'from version import DISPLAY_VERSION; print(DISPLAY_VERSION)')"
+BUILD_NUMBER="$(git -C "$SCRIPT_DIR" rev-list --count HEAD 2>/dev/null || echo 1)"
+BUILD_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+MIN_MACOS=""
+DIRTY_NOTE=""
+if [ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]; then
+    DIRTY_NOTE=", uncommitted changes"
+fi
 
 print_usage() {
     echo "Usage: ./build.sh [local|share]"
@@ -36,6 +45,19 @@ fail() {
     echo ""
     echo "ERROR: $1" >&2
     exit 1
+}
+
+# A tester build has to be reproducible from a commit, or a bug report cannot
+# be traced back to the code that produced it.
+ensure_clean_tree_for_share() {
+    [ "$MODE" = "share" ] || return 0
+    [ -z "$DIRTY_NOTE" ] && return 0
+    if [ "${ALLOW_DIRTY:-0}" = "1" ]; then
+        echo "  WARNING: building a share build from uncommitted changes (ALLOW_DIRTY=1)."
+        return 0
+    fi
+    git -C "$SCRIPT_DIR" status --short
+    fail "Share builds must come from a committed tree. Commit (and tag) first, or set ALLOW_DIRTY=1 for a throwaway build."
 }
 
 ensure_supported_mode() {
@@ -73,23 +95,38 @@ binary_supports_host_arch() {
     esac
 }
 
-copy_native_ffmpeg_from_path() {
-    local ffmpeg_path ffprobe_path
-    ffmpeg_path="$(command -v ffmpeg || true)"
-    ffprobe_path="$(command -v ffprobe || true)"
+ffmpeg_bin_is_self_contained() {
+    [ -f "$FFMPEG_DIR/ffmpeg" ] && [ -f "$FFMPEG_DIR/ffprobe" ] || return 1
+    python3 "$BUNDLE_TOOL" verify "$FFMPEG_DIR" --require-executables >/dev/null 2>&1
+}
 
-    if [ -z "$ffmpeg_path" ] || [ -z "$ffprobe_path" ]; then
+# Copies ffmpeg/ffprobe from PATH (or FFMPEG_SOURCE_DIR) together with every
+# non-system dylib they load, relinked to @loader_path. Copying only the two
+# executables used to produce a bundle that worked on the build Mac and nowhere
+# else, since a Homebrew ffmpeg is a stub over /opt/homebrew/Cellar/*/lib.
+bundle_ffmpeg_from_host() {
+    local ffmpeg_path ffprobe_path
+    if [ -n "${FFMPEG_SOURCE_DIR:-}" ]; then
+        ffmpeg_path="$FFMPEG_SOURCE_DIR/ffmpeg"
+        ffprobe_path="$FFMPEG_SOURCE_DIR/ffprobe"
+    else
+        ffmpeg_path="$(command -v ffmpeg || true)"
+        ffprobe_path="$(command -v ffprobe || true)"
+    fi
+
+    if [ -z "$ffmpeg_path" ] || [ -z "$ffprobe_path" ] \
+        || [ ! -f "$ffmpeg_path" ] || [ ! -f "$ffprobe_path" ]; then
         return 1
     fi
     if ! binary_supports_host_arch "$ffmpeg_path" || ! binary_supports_host_arch "$ffprobe_path"; then
+        echo "  $ffmpeg_path is not built for $HOST_ARCH."
         return 1
     fi
 
-    mkdir -p "$FFMPEG_DIR"
-    cp "$ffmpeg_path" "$FFMPEG_DIR/ffmpeg"
-    cp "$ffprobe_path" "$FFMPEG_DIR/ffprobe"
-    chmod +x "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/ffprobe"
-    return 0
+    echo "  Bundling $ffmpeg_path and its libraries..."
+    rm -rf "$FFMPEG_DIR/lib"
+    rm -f "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/ffprobe"
+    python3 "$BUNDLE_TOOL" bundle --ffmpeg "$ffmpeg_path" --ffprobe "$ffprobe_path" --dest "$FFMPEG_DIR"
 }
 
 setup_python_env() {
@@ -117,63 +154,31 @@ ensure_ffmpeg() {
     echo "[2/7] Checking ffmpeg binaries..."
     echo "  Host architecture: $HOST_ARCH"
 
-    if [ -f "$FFMPEG_DIR/ffmpeg" ] && [ -f "$FFMPEG_DIR/ffprobe" ]; then
-        if binary_supports_host_arch "$FFMPEG_DIR/ffmpeg" && binary_supports_host_arch "$FFMPEG_DIR/ffprobe"; then
-            echo "  ffmpeg binaries already present and native-compatible."
-        else
-            echo "  Existing ffmpeg binaries are not native-compatible for $HOST_ARCH."
-            rm -f "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/ffprobe"
+    if ffmpeg_bin_is_self_contained && binary_supports_host_arch "$FFMPEG_DIR/ffmpeg" \
+        && binary_supports_host_arch "$FFMPEG_DIR/ffprobe"; then
+        echo "  ffmpeg_bin/ is self-contained and native for $HOST_ARCH."
+    else
+        if [ -f "$FFMPEG_DIR/ffmpeg" ]; then
+            echo "  ffmpeg_bin/ is not self-contained (or not native) — rebuilding it."
         fi
+        bundle_ffmpeg_from_host || fail "No usable ffmpeg. Install it with 'brew install ffmpeg', set FFMPEG_SOURCE_DIR to a folder holding ffmpeg + ffprobe, or put self-contained (static) binaries in ffmpeg_bin/."
     fi
 
-    if [ ! -f "$FFMPEG_DIR/ffmpeg" ] || [ ! -f "$FFMPEG_DIR/ffprobe" ]; then
-        echo "  Looking for native ffmpeg/ffprobe in PATH..."
-        if copy_native_ffmpeg_from_path; then
-            echo "  Copied native ffmpeg binaries from PATH."
-        fi
-    fi
+    # Guard against a hand-placed binary as well as a failed bundle.
+    python3 "$BUNDLE_TOOL" verify "$FFMPEG_DIR" --require-executables \
+        || fail "ffmpeg_bin/ still depends on libraries outside the bundle"
 
-    if [ ! -f "$FFMPEG_DIR/ffmpeg" ] || [ ! -f "$FFMPEG_DIR/ffprobe" ]; then
-        echo "  Downloading ffmpeg static build for macOS..."
-        mkdir -p "$FFMPEG_DIR"
-
-        if [ "$HOST_ARCH" = "arm64" ]; then
-            echo "  Detected Apple Silicon (arm64)"
-        else
-            echo "  Detected Intel (x86_64)"
-        fi
-
-        ffmpeg_url="https://evermeet.cx/ffmpeg/ffmpeg-7.1.1.zip"
-        ffprobe_url="https://evermeet.cx/ffmpeg/ffprobe-7.1.1.zip"
-
-        if [ ! -f "$FFMPEG_DIR/ffmpeg" ]; then
-            echo "  Downloading ffmpeg..."
-            curl -L -o "$FFMPEG_DIR/ffmpeg.zip" "$ffmpeg_url"
-            unzip -o "$FFMPEG_DIR/ffmpeg.zip" -d "$FFMPEG_DIR/"
-            rm -f "$FFMPEG_DIR/ffmpeg.zip"
-            chmod +x "$FFMPEG_DIR/ffmpeg"
-        fi
-
-        if [ ! -f "$FFMPEG_DIR/ffprobe" ]; then
-            echo "  Downloading ffprobe..."
-            curl -L -o "$FFMPEG_DIR/ffprobe.zip" "$ffprobe_url"
-            unzip -o "$FFMPEG_DIR/ffprobe.zip" -d "$FFMPEG_DIR/"
-            rm -f "$FFMPEG_DIR/ffprobe.zip"
-            chmod +x "$FFMPEG_DIR/ffprobe"
-        fi
-    fi
-
-    if ! binary_supports_host_arch "$FFMPEG_DIR/ffmpeg" || ! binary_supports_host_arch "$FFMPEG_DIR/ffprobe"; then
-        echo "  ffmpeg archs:  $(binary_archs "$FFMPEG_DIR/ffmpeg" || true)"
-        echo "  ffprobe archs: $(binary_archs "$FFMPEG_DIR/ffprobe" || true)"
-        fail "Bundled ffmpeg must support host architecture '$HOST_ARCH'. Install native ffmpeg with Homebrew or provide universal binaries in ffmpeg_bin/."
-    fi
-
+    MIN_MACOS="$(python3 "$BUNDLE_TOOL" verify "$FFMPEG_DIR" --print-minos)"
+    MIN_MACOS="${MIN_MACOS:-12.0}"
     echo "  ffmpeg archs:  $(binary_archs "$FFMPEG_DIR/ffmpeg" || true)"
     echo "  ffprobe archs: $(binary_archs "$FFMPEG_DIR/ffprobe" || true)"
+    echo "  Lowest macOS the bundled ffmpeg can run on: $MIN_MACOS"
 
-    echo "  ffmpeg: $("$FFMPEG_DIR/ffmpeg" -version 2>&1 | head -1)" || echo "  WARNING: Could not verify ffmpeg"
-    echo "  ffprobe: $("$FFMPEG_DIR/ffprobe" -version 2>&1 | head -1)" || echo "  WARNING: Could not verify ffprobe"
+    "$FFMPEG_DIR/ffmpeg" -hide_banner -version >/dev/null 2>&1 \
+        || fail "Bundled ffmpeg does not run on this machine"
+    "$FFMPEG_DIR/ffprobe" -hide_banner -version >/dev/null 2>&1 \
+        || fail "Bundled ffprobe does not run on this machine"
+    echo "  ffmpeg: $("$FFMPEG_DIR/ffmpeg" -version 2>&1 | head -1)"
     echo "  VideoToolbox encoders:"
     "$FFMPEG_DIR/ffmpeg" -hide_banner -encoders 2>/dev/null | grep -E 'h264_videotoolbox|hevc_videotoolbox' | sed 's/^/    /' || echo "    WARNING: VideoToolbox encoders not found"
 }
@@ -193,102 +198,14 @@ build_app() {
     chmod -R u+w ~/Library/Application\ Support/pyinstaller/ 2>/dev/null || true
     rm -rf ~/Library/Application\ Support/pyinstaller/ 2>/dev/null || true
 
-    pyinstaller \
-        --name "$APP_NAME" \
-        --windowed \
-        --onedir \
-        --icon "$BUILD_DIR/app_icon.icns" \
-        --osx-bundle-identifier "com.uniqualizer.video" \
-        --codesign-identity "-" \
-        --add-data "$FFMPEG_DIR/ffmpeg:ffmpeg" \
-        --add-data "$FFMPEG_DIR/ffprobe:ffmpeg" \
-        --add-data "$SRC_DIR/engine.py:." \
-        --add-data "$SRC_DIR/icons.py:." \
-        --add-data "$SRC_DIR/styles.py:." \
-        --hidden-import PyQt6.sip \
-        --hidden-import PyQt6.QtCore \
-        --hidden-import PyQt6.QtGui \
-        --hidden-import PyQt6.QtWidgets \
-        \
-        --exclude-module PyQt6.QtNetwork \
-        --exclude-module PyQt6.QtDBus \
-        --exclude-module PyQt6.QtSvg \
-        --exclude-module PyQt6.QtSvgWidgets \
-        --exclude-module PyQt6.QtOpenGL \
-        --exclude-module PyQt6.QtOpenGLWidgets \
-        --exclude-module PyQt6.QtQml \
-        --exclude-module PyQt6.QtQuick \
-        --exclude-module PyQt6.QtQuickWidgets \
-        --exclude-module PyQt6.QtQuick3D \
-        --exclude-module PyQt6.QtDesigner \
-        --exclude-module PyQt6.QtHelp \
-        --exclude-module PyQt6.QtMultimedia \
-        --exclude-module PyQt6.QtMultimediaWidgets \
-        --exclude-module PyQt6.QtPdf \
-        --exclude-module PyQt6.QtPdfWidgets \
-        --exclude-module PyQt6.QtPositioning \
-        --exclude-module PyQt6.QtBluetooth \
-        --exclude-module PyQt6.QtNfc \
-        --exclude-module PyQt6.QtWebChannel \
-        --exclude-module PyQt6.QtWebEngineCore \
-        --exclude-module PyQt6.QtWebEngineWidgets \
-        --exclude-module PyQt6.QtWebSockets \
-        --exclude-module PyQt6.QtRemoteObjects \
-        --exclude-module PyQt6.QtSensors \
-        --exclude-module PyQt6.QtSerialPort \
-        --exclude-module PyQt6.QtSql \
-        --exclude-module PyQt6.QtTest \
-        --exclude-module PyQt6.QtXml \
-        --exclude-module PyQt6.Qt3DCore \
-        --exclude-module PyQt6.Qt3DRender \
-        --exclude-module PyQt6.Qt3DInput \
-        --exclude-module PyQt6.Qt3DLogic \
-        --exclude-module PyQt6.Qt3DExtras \
-        --exclude-module PyQt6.Qt3DAnimation \
-        --exclude-module PyQt6.QtCharts \
-        --exclude-module PyQt6.QtDataVisualization \
-        --exclude-module PyQt6.QtStateMachine \
-        --exclude-module PyQt6.QtTextToSpeech \
-        --exclude-module PyQt6.QtVirtualKeyboard \
-        --exclude-module PyQt6.QtHttpServer \
-        --exclude-module PyQt6.QtSpatialAudio \
-        \
-        --exclude-module tkinter \
-        --exclude-module _tkinter \
-        --exclude-module sqlite3 \
-        --exclude-module unittest \
-        --exclude-module pydoc \
-        --exclude-module doctest \
-        --exclude-module xmlrpc \
-        --exclude-module ftplib \
-        --exclude-module imaplib \
-        --exclude-module smtplib \
-        --exclude-module nntplib \
-        --exclude-module poplib \
-        --exclude-module telnetlib \
-        --exclude-module turtle \
-        --exclude-module turtledemo \
-        --exclude-module test \
-        --exclude-module idlelib \
-        --exclude-module lib2to3 \
-        --exclude-module ensurepip \
-        --exclude-module venv \
-        --exclude-module distutils \
-        --exclude-module setuptools \
-        --exclude-module pip \
-        --exclude-module pkg_resources \
-        --exclude-module numpy \
-        --exclude-module PIL \
-        --exclude-module matplotlib \
-        --exclude-module scipy \
-        --exclude-module pandas \
-        \
+    # The spec is the single source for bundle contents, excludes, version and
+    # Info.plist; build.sh only supplies the values it has to compute.
+    UNIQ_BUILD_NUMBER="$BUILD_NUMBER" UNIQ_MIN_MACOS="$MIN_MACOS" pyinstaller \
         --noconfirm \
         --clean \
         --distpath "$DIST_DIR" \
         --workpath "$BUILD_DIR/pyinstaller" \
-        --specpath "$BUILD_DIR" \
-        "$SRC_DIR/main.py"
+        "$SCRIPT_DIR/VideoUniqualizer.spec"
 }
 
 optimize_bundle() {
@@ -378,8 +295,8 @@ sign_bundle() {
     codesign --force --sign - "$MACOS_DIR/$APP_NAME" 2>/dev/null || true
 
     echo "  Signing bundled ffmpeg binaries..."
-    find "$APP_DIR" -path '*/ffmpeg/ffmpeg' -type f -exec codesign --force --sign - {} \; 2>/dev/null || true
-    find "$APP_DIR" -path '*/ffmpeg/ffprobe' -type f -exec codesign --force --sign - {} \; 2>/dev/null || true
+    find "$APP_DIR" -path '*/ffmpeg/ffmpeg' -type f -exec codesign --force --sign - {} \;
+    find "$APP_DIR" -path '*/ffmpeg/ffprobe' -type f -exec codesign --force --sign - {} \;
 
     echo "  Signing the entire .app bundle..."
     codesign --force --deep --sign - "$APP_DIR"
@@ -402,6 +319,34 @@ check_broken_symlinks() {
     fi
 
     echo "  ✓ No broken symlinks found"
+}
+
+# The load-command check proves nothing points outside the bundle; running the
+# bundled ffmpeg under DYLD_PRINT_LIBRARIES proves dyld agrees. Both are needed
+# because the build Mac has every Homebrew library installed, so an unbundled
+# ffmpeg would pass any test that only checks it runs.
+check_bundled_ffmpeg() {
+    echo "  Checking bundled ffmpeg is self-contained..."
+
+    local ffmpeg_in_app ffmpeg_root
+    ffmpeg_in_app="$(find "$APP_DIR" -path '*/ffmpeg/ffmpeg' -type f | head -1)"
+    [ -n "$ffmpeg_in_app" ] || fail "ffmpeg is missing from the app bundle"
+    ffmpeg_root="$(dirname "$ffmpeg_in_app")"
+
+    python3 "$BUNDLE_TOOL" verify "$ffmpeg_root" --require-executables --boundary "$APP_DIR" \
+        || fail "Bundled ffmpeg depends on libraries outside the app"
+
+    local outside
+    outside="$(DYLD_PRINT_LIBRARIES=1 "$ffmpeg_in_app" -hide_banner \
+        -f lavfi -i testsrc=d=0.2:s=64x64 -c:v libx264 -f null - 2>&1 \
+        | sed -nE 's/^dyld\[[0-9]+\]: <[^>]+> (\/.*)$/\1/p' \
+        | grep -vE '^/(System|usr/lib)/' \
+        | grep -vF "$APP_DIR" || true)"
+    if [ -n "$outside" ]; then
+        echo "$outside" | sed 's/^/    /'
+        fail "Bundled ffmpeg loaded libraries from outside the app"
+    fi
+    echo "  ✓ ffmpeg loads only system and bundled libraries"
 }
 
 smoke_test_app() {
@@ -447,6 +392,7 @@ run_validations() {
     echo "[7/7] Validating bundle..."
     verify_codesign
     check_broken_symlinks
+    check_bundled_ffmpeg
     smoke_test_app
     check_spctl_status
 }
@@ -478,8 +424,9 @@ create_release_notes() {
     build_date="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 
     cat > "$RELEASE_NOTES_PATH" <<EOF
-Video Uniqualizer - Internal Test Build
+Video Uniqualizer $APP_VERSION (build $BUILD_NUMBER, commit $BUILD_COMMIT$DIRTY_NOTE)
 Build date: $build_date
+Requires: macOS $MIN_MACOS or later, $HOST_ARCH
 
 Included artifacts:
 - $APP_NAME.app
@@ -505,6 +452,7 @@ Support note:
 - Do not disable Gatekeeper globally.
 - Do not change SIP.
 - If launch still fails, send back the exact macOS warning dialog and the build artifacts you received.
+- For any processing problem, use Help -> Copy Diagnostics in the app and paste the result into your report.
 EOF
 }
 
@@ -545,9 +493,10 @@ print_summary() {
 
 main() {
     ensure_supported_mode
+    ensure_clean_tree_for_share
 
     echo "============================================"
-    echo "  Building $APP_NAME ($MODE mode)"
+    echo "  Building $APP_NAME $APP_VERSION ($MODE mode, build $BUILD_NUMBER, $BUILD_COMMIT$DIRTY_NOTE)"
     echo "============================================"
 
     cleanup_previous_outputs

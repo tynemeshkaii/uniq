@@ -16,16 +16,39 @@ FFMPEG_DIR = os.path.join(SCRIPT_DIR, 'ffmpeg_bin')
 # Data files to include
 datas = [
     (os.path.join(SRC_DIR, 'engine.py'), '.'),
+    (os.path.join(SRC_DIR, 'image_engine.py'), '.'),
+    (os.path.join(SRC_DIR, 'exif.py'), '.'),
     (os.path.join(SRC_DIR, 'icons.py'), '.'),
     (os.path.join(SRC_DIR, 'styles.py'), '.'),
+    (os.path.join(SRC_DIR, 'version.py'), '.'),
+    (os.path.join(SRC_DIR, 'applog.py'), '.'),
 ]
+# fingerprint.py and verify_quality.py are deliberately absent: they are the
+# dev-time measurement tools and nothing in main.py imports them, so they stay
+# out of the bundle.
 
-# Add ffmpeg binaries if they exist. For best macOS performance, these should
-# be native or universal binaries for the target architecture.
-if os.path.isfile(os.path.join(FFMPEG_DIR, 'ffmpeg')):
-    datas.append((os.path.join(FFMPEG_DIR, 'ffmpeg'), 'ffmpeg'))
-if os.path.isfile(os.path.join(FFMPEG_DIR, 'ffprobe')):
-    datas.append((os.path.join(FFMPEG_DIR, 'ffprobe'), 'ffmpeg'))
+# ffmpeg/ffprobe arrive from tools/bundle_ffmpeg.py already relinked to their
+# dylibs in ffmpeg_bin/lib. They go in as `binaries`, so PyInstaller follows
+# those references itself: it collects the dylibs into Contents/Frameworks,
+# relinks them to @rpath and signs them. Listing lib/ as data as well would
+# ship every library twice. build.sh verifies the result stays inside the app.
+binaries = []
+for _tool in ('ffmpeg', 'ffprobe'):
+    if os.path.isfile(os.path.join(FFMPEG_DIR, _tool)):
+        binaries.append((os.path.join(FFMPEG_DIR, _tool), 'ffmpeg'))
+
+# Version comes from src/version.py so the About text, the log header and
+# Info.plist cannot disagree.
+_version_ns = {}
+with open(os.path.join(SRC_DIR, 'version.py')) as _f:
+    exec(_f.read(), _version_ns)
+APP_VERSION = _version_ns['VERSION']
+# build.sh passes the git commit count; a manual spec build falls back to 1.
+BUILD_NUMBER = os.environ.get('UNIQ_BUILD_NUMBER', '1')
+# build.sh passes the highest deployment target among the bundled Mach-O
+# files. Homebrew bottles target the macOS they were built on, so this is
+# usually far above what the Python/Qt side needs — and it is the real floor.
+MIN_MACOS = os.environ.get('UNIQ_MIN_MACOS', '12.0')
 
 # Icon file
 icon_file = os.path.join(SCRIPT_DIR, 'build', 'app_icon.icns')
@@ -93,7 +116,7 @@ EXCLUDES = [
 a = Analysis(
     [os.path.join(SRC_DIR, 'main.py')],
     pathex=[SRC_DIR],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=[
         'PyQt6.sip',
@@ -121,7 +144,7 @@ exe = EXE(
     name='Video Uniqualizer',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,           # Strip debug symbols
+    strip=False,          # build.sh strips after collection, then re-signs
     upx=False,
     console=False,
     disable_windowed_traceback=False,
@@ -136,7 +159,7 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    strip=True,           # Strip all collected binaries
+    strip=False,
     upx=False,
     upx_exclude=[],
     name='Video Uniqualizer',
@@ -149,9 +172,9 @@ app = BUNDLE(
     bundle_identifier='com.uniqualizer.video',
     info_plist={
         'NSHighResolutionCapable': True,
-        'CFBundleShortVersionString': '1.0.0',
-        'CFBundleVersion': '1.0.0',
+        'CFBundleShortVersionString': APP_VERSION,
+        'CFBundleVersion': BUILD_NUMBER,
         'NSHumanReadableCopyright': 'Video Uniqualizer',
-        'LSMinimumSystemVersion': '10.15',
+        'LSMinimumSystemVersion': MIN_MACOS,
     },
 )

@@ -1,18 +1,102 @@
 # Video Uniqualizer
 
-Standalone macOS application for video uniqualization based on HYBRID V9.0 engine.
+Standalone macOS application for video and image uniqualization, based on the HYBRID V9.0 engine.
 
 ## Features
 
-- Select multiple video files for batch processing
+- Select multiple video **and image** files for batch processing — a mixed batch runs the stills first, then the video
 - Choose output folder
 - Adjustable parameters (geometry, color, effects, output settings)
-- V9.0 defaults loaded as template on startup
+- Every parameter is redrawn per file, so no two outputs share a setting
+- JPEG and PNG output with fabricated camera EXIF, written directly (ffmpeg cannot author EXIF)
+- Stills keep the source aspect ratio and resolution, so Meta Ads placement is unaffected
+- Camera-style metadata with the encoder's own fingerprints stripped
+- Parallel encoding of several files at once
 - macOS performance profiles: Max Quality, Balanced, and Fast Mac
 - VideoToolbox hardware encoding support for Apple Silicon and Intel Macs
 - Built-in encoder benchmark for checking real Mac performance
+- Built-in quality gate that measures both picture quality and how far the
+  output has moved from the source's perceptual fingerprint (`src/verify_quality.py`)
 - ffmpeg bundled inside the app — no external dependencies needed
 - Skeuomorphic dark UI design
+
+## Quality verification
+
+The defaults are chosen so an output is indistinguishable from its source to a
+viewer. To confirm that on your own footage:
+
+```bash
+python3 src/verify_quality.py /path/to/clip.mp4
+```
+
+It reports two opposing things. The quality side checks the clip against a
+frame-aligned twin encoded with the same geometry but no colour/noise/sharpen/
+vignette stage. The uniqueness side reports how far the output has moved from
+the source under a perceptual hash and an audio fingerprint, labelling each as
+evading or still matching a typical matcher — how far it moves depends heavily
+on the footage, so run it on your own material rather than trusting a default.
+
+The single biggest lever on that number is the zoom range, not any of the
+filters: reframing is what a perceptual hash cannot ignore. It costs sharpness,
+because the crop is scaled back up to the output size.
+
+The quality comparison isolates
+degradation from reframing, which a pixel metric would otherwise punish even
+though it looks perfectly normal. Reported checks:
+
+| Check | Meaning |
+|---|---|
+| SSIM / PSNR vs clean twin | how much the effects stage costs the picture |
+| loudness shift, true peak | audio is neither crushed nor clipping |
+| A/V start offset, duration drift | lip sync stays inside the perceptible threshold |
+| uncovered edge pixels | no black wedges from rotation, lens or warp |
+| encoder fingerprints | no `x264` / `Lavf` / `Lavc` strings left in the file |
+| per-file randomisation | consecutive outputs really do differ |
+
+It also writes two PNGs per clip — a full-frame source/output pair and a 1:1
+detail crop — so the result can be judged by eye, which is the test that
+actually matters. Green bar marks the source, red the output.
+
+Run it with no arguments to check against a generated synthetic clip.
+
+### Images
+
+The same command takes a photo, and routes by extension:
+
+```bash
+python3 src/verify_quality.py /path/to/photo.jpg --keep /tmp/uniq-check
+```
+
+Everything that needs a timeline is dropped, and two checks are added:
+
+| Check | Meaning |
+|---|---|
+| aspect preserved | the output ratio matches the source's, within an allowance that scales with the source size |
+| camera metadata | the written EXIF names a real device profile and carries a capture date |
+| alpha preserved | a transparent PNG comes out transparent, not composited onto black |
+
+Transparency is handled rather than ignored: for PNG output the geometry runs on
+the RGBA frame, the alpha plane is split off before the effect stage and merged
+back afterwards, so a cut-out or logo keeps its transparency. Forcing JPEG on a
+transparent source flattens it onto white, not ffmpeg's implicit black.
+
+Rotated sources work too. A portrait phone photo stores landscape pixels plus an
+EXIF orientation, and ffmpeg rotates on decode, so the pipeline plans its crop
+against the rotated dimensions.
+
+Measured on photographs, the picture is the same as for video, only starker:
+reframing is the *only* thing that moves the perceptual hash. Rotation, lens
+distortion, micro-warp, the tone curve, hue, eq, grain, sharpening, vignette
+and the JPEG quality draw each measured zero in isolation; `zoom` measured 6,
+12 and 20 bits at 1.02-1.05, 1.06-1.14 and 1.14-1.22, against a matcher
+threshold near 10. The defaults land at 16-18, and a plain re-encode — the
+control — scores 0. The zero-scoring stages stay because they defeat different
+attacks (byte hashes, colour normalisation, a matcher that has solved
+alignment), not because they move this number.
+
+Note that Meta strips EXIF when a creative is uploaded. The metadata work is
+for the file as it exists on disk, not for what survives inside the ad — the
+pixel-side levers are what carry uniqueness through the upload.
 
 ## Building the .app
 
@@ -137,8 +221,31 @@ The benchmark compares available encoders such as `libx264`,
 ├── src/
 │   ├── main.py           # Application entry point + GUI
 │   ├── engine.py         # Video processing engine (HYBRID V9.0)
+│   ├── image_engine.py   # Still-image pipeline, sharing engine.py's filter graph
+│   ├── exif.py           # EXIF / PNG metadata writer (no third-party dependency)
+│   ├── verify_quality.py # Quality gate — run this after changing either engine
+│   ├── fingerprint.py    # pHash + audio fingerprints used by the gate
 │   ├── icons.py          # Programmatically drawn icons
 │   ├── styles.py         # Skeuomorphic Qt stylesheet
 │   └── gen_icns.py       # macOS .icns icon generator
 └── ffmpeg_bin/           # ffmpeg binaries (created during build)
 ```
+
+## How the engine is wired
+
+`RandomRanges` is the spec the UI owns: min/max for every effect plus the
+feature toggles. `process_batch` draws a fresh `UniqueParams` from it for each
+input file, then copies only the output-container settings (resolution, CRF,
+preset, encoder, overlay) from the template. Anything randomized therefore
+varies per file rather than per batch.
+
+`plan_geometry` resolves rotation safety margin, micro-crop, zoom and pan into
+a single crop rectangle computed in Python, so the filter graph carries literal
+even numbers. `build_video_chain` and `build_audio_chain` are pure functions of
+those values, which is what makes the quality gate able to exercise the chain
+without encoding a file.
+
+Perceptual caps live in `engine.py` as `MAX_*` constants — audio delay, rotation
+angle, hue rotation, and the speech-safe speed and pitch bands. The UI spin
+boxes are bounded by the same constants, so a setting that would be visible or
+audible cannot be dialled in.

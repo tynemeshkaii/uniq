@@ -1547,9 +1547,14 @@ def build_video_chain(p: UniqueParams, plan: GeometryPlan, has_overlay: bool,
         # same conversion or it would sit washed out around a correct picture.
         bg_w, bg_h = _even(tw // 4), _even(th // 4)
         bg_hdr = f"{hdr_step}," if hdr_step else ""
+        # scale keeps the display aspect by rewriting the sample aspect ratio:
+        # squeezing a square source into 9:16 leaves the backdrop at SAR 16:9.
+        # overlay takes its SAR from this, the main input, so without the
+        # setsar a 1080x1920 output plays back as a 1920x1920 square.
         chain = (
             f"[0:v]split=2[bg_src][fg_src];"
-            f"[bg_src]scale={bg_w}:{bg_h},{bg_hdr}avgblur=sizeX=5:sizeY=5,scale={tw}:{th}[bg];"
+            f"[bg_src]scale={bg_w}:{bg_h},{bg_hdr}avgblur=sizeX=5:sizeY=5,"
+            f"scale={tw}:{th},setsar=1[bg];"
             f"[fg_src]{fg}[fg];"
             f"[bg][fg]overlay={(tw - plan.fg_w) // 2}:{(th - plan.fg_h) // 2}[base]"
         )

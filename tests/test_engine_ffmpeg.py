@@ -105,6 +105,28 @@ def test_match_source_keeps_the_source_frame(media, tmp_path):
     assert _dims(os.path.join(tmp_path, out)) == (640, 360)
 
 
+def test_backdrop_preset_writes_square_pixels(media, tmp_path):
+    """A 9:16 preset over a landscape source goes through the blurred backdrop.
+
+    Scaling the backdrop to a different aspect rewrites its SAR, overlay takes
+    that SAR, and a 1080x1920 file then played back as a 1920x1920 square.
+    """
+    template = engine.UniqueParams()
+    template.target_width, template.target_height = 360, 640
+    template.preset = "ultrafast"
+    ok, errors = engine.process_batch([media["land"]], str(tmp_path),
+                                      params_template=template, max_workers=1)
+    assert ok == 1, errors
+    (out,) = os.listdir(tmp_path)
+    sar = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=sample_aspect_ratio", "-of", "csv=p=0",
+         os.path.join(tmp_path, out)],
+        capture_output=True, text=True, check=True).stdout.strip()
+    assert _dims(os.path.join(tmp_path, out)) == (360, 640)
+    assert sar in ("1:1", "N/A"), sar
+
+
 def test_per_file_callbacks_are_keyed_by_path(media, tmp_path):
     template = engine.UniqueParams()
     template.preset = "ultrafast"

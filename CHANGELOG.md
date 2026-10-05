@@ -9,6 +9,10 @@ release job publishes that section as the GitHub release notes.
 ## Unreleased
 
 ### Fixed
+- A video whose shape differs from the chosen size (e.g. a square clip with
+  "9:16 Vertical") came out 1080×1920 but played back as a 1920×1920 square:
+  the blurred backdrop left a non-square pixel flag on the file. Outputs now
+  always have square pixels and play at the size chosen.
 - HDR videos from iPhones (HLG / Dolby Vision) and HDR10 sources came out as
   8-bit HDR, which shows banding and looks washed out anywhere HDR is not
   honoured. They are now converted to standard SDR (BT.709), with HDR

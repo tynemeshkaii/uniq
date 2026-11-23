@@ -31,8 +31,10 @@ import os
 import random
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from gentle_compression import JPEG_QUALITY_STEPS, CompressionResult, file_error, finish_compression
 from typing import Callable, List, Optional, Tuple
 
 import exif
@@ -258,6 +260,8 @@ class ImageParams:
     jpeg_huffman: str = "optimal"
     png_compression: int = 7
     png_pred: str = "mixed"
+    gentle_compression: bool = False
+    keep_without_saving: bool = False
 
     # Meta
     fake_meta: bool = True
@@ -349,6 +353,7 @@ class ImageParams:
 # the video pipeline's _STATIC_FIELDS discipline. A new output-container field
 # added to ImageParams must be listed here or it will vary per file.
 _STATIC_IMAGE_FIELDS = [
+    "gentle_compression", "keep_without_saving",
     "output_format", "max_long_side", "fake_meta",
 ]
 
@@ -509,14 +514,12 @@ def _build_exif_fields(profile: dict, date_str: str, width: int, height: int) ->
     }
 
 
-def _apply_metadata(path: str, p: ImageParams, profile: dict, date_str: str,
-                    width: int, height: int) -> Optional[str]:
+def _apply_metadata(path: str, p: ImageParams, fields: dict) -> Optional[str]:
     """Write the camera identity into the encoded file. Returns an error or None."""
     try:
         with open(path, "rb") as fh:
             data = fh.read()
 
-        fields = _build_exif_fields(profile, date_str, width, height)
         if p.output_format == "png":
             out = exif.insert_png_text(data, [
                 ("Make", str(fields["make"])),
@@ -529,7 +532,9 @@ def _apply_metadata(path: str, p: ImageParams, profile: dict, date_str: str,
 
         with open(path, "wb") as fh:
             fh.write(out)
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
+        return file_error(exc)
+    except ValueError as exc:
         return f"metadata write failed: {exc}"
     return None
 
@@ -541,12 +546,35 @@ def _cleanup(path: str):
         pass
 
 
+def _run_image_encode(cmd, cancelled):
+    deadline = time.monotonic() + _FFMPEG_IMAGE_TIMEOUT
+    with subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True) as proc:
+        while True:
+            remaining = deadline - time.monotonic()
+            interrupted = cancelled and cancelled()
+            if interrupted or remaining <= 0:
+                proc.kill()
+                proc.communicate()
+                return "cancelled" if interrupted else f"ffmpeg timed out after {_FFMPEG_IMAGE_TIMEOUT}s"
+            try:
+                _, stderr = proc.communicate(timeout=min(0.2, remaining) if cancelled else remaining)
+            except subprocess.TimeoutExpired:
+                continue
+            if not proc.returncode:
+                return ""
+            if is_disk_full(stderr):
+                return DISK_FULL_ERROR
+            log.warning("ffmpeg failed: %s\n%s", cmd, stderr)
+            return f"ffmpeg exited with code {proc.returncode}: {stderr.strip()[:500]}"
+
+
 def process_single_image(
     input_path: str,
     output_folder: str,
     index: int,
     params: Optional[ImageParams] = None,
     cancelled: Optional[Callable[[], bool]] = None,
+    compression_callback: Optional[Callable[[CompressionResult], None]] = None,
 ) -> Tuple[bool, str]:
     """Process one image. Returns (success, error_message)."""
     if is_unsupported_image(input_path):
@@ -554,7 +582,13 @@ def process_single_image(
         return False, (f"{ext} is not supported by the bundled ffmpeg — "
                        f"convert to JPEG or PNG first")
 
-    p = params or ImageParams.generate_random()
+    p = replace(params) if params else ImageParams.generate_random()
+    info = probe_file(input_path)
+    if not info.has_geometry:
+        return False, "could not read image dimensions (unsupported or corrupt file)"
+
+    if p.gentle_compression and p.output_format == "auto" and info.has_alpha:
+        p.output_format = "png"
     p.output_format = choose_output_format(input_path, p.output_format)
 
     # Grain and the vignette are dropped for PNG, and only for PNG. Both are
@@ -571,10 +605,6 @@ def process_single_image(
         p.noise_strength = 0
         p.vignette_angle = 0.0
 
-    info = probe_file(input_path)
-    if not info.has_geometry:
-        return False, "could not read image dimensions (unsupported or corrupt file)"
-
     p.target_width, p.target_height = plan_image_canvas(info.width, info.height, p)
     plan = plan_geometry(info.width, info.height, p)
 
@@ -582,60 +612,48 @@ def process_single_image(
     date_str = UniqueParams.random_date_str()
     ext = ".png" if p.output_format == "png" else ".jpg"
 
-    if p.fake_meta:
-        output_path, date_str = reserve_natural_filepath(
-            output_folder, profile, date_str, kind="image", ext=ext)
-    else:
-        output_path = unique_filepath(output_folder, f"uniq_{index:04d}{ext}")
-
-    if cancelled and cancelled():
-        _cleanup(output_path)
-        return False, "cancelled"
-
-    cmd = [
-        get_ffmpeg_path(), "-y", "-nostdin",
-        "-i", input_path,
-    ] + build_image_graph(p, plan, info.width, info.height, info.has_alpha) + [
-        "-frames:v", "1",
-    ] + _encode_args(p, info.has_alpha) + [
-        "-map_metadata", "-1",
-        # Suppresses the "Lavc<ver>" comment ffmpeg otherwise embeds.
-        "-fflags", "+bitexact", "-flags:v", "+bitexact",
-        "-loglevel", "error",
-        output_path,
-    ]
-
+    graph = build_image_graph(p, plan, info.width, info.height, info.has_alpha)
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=_FFMPEG_IMAGE_TIMEOUT
-        )
-    except subprocess.TimeoutExpired:
-        _cleanup(output_path)
-        return False, f"ffmpeg timed out after {_FFMPEG_IMAGE_TIMEOUT}s"
+        if p.fake_meta:
+            output_path, date_str = reserve_natural_filepath(
+                output_folder, profile, date_str, kind="image", ext=ext, reserve=not p.gentle_compression)
+        else:
+            output_path = unique_filepath(output_folder, f"uniq_{index:04d}{ext}", reserve=not p.gentle_compression)
     except OSError as exc:
+        return False, file_error(exc)
+    fields = _build_exif_fields(profile, date_str, plan.fg_w, plan.fg_h) if p.fake_meta else None
+
+    def encode(path, attempt):
+        if p.gentle_compression:
+            p.jpeg_quality = JPEG_QUALITY_STEPS[attempt]
+            p.jpeg_huffman = "optimal"
+            p.png_compression = 9
+            p.png_pred = "mixed"
+        cmd = [get_ffmpeg_path(), "-y", "-nostdin", "-i", input_path,
+               *graph, "-frames:v", "1", *_encode_args(p, info.has_alpha),
+               "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact",
+               "-loglevel", "error", path]
+        try:
+            error = _run_image_encode(cmd, cancelled)
+        except OSError as exc:
+            return file_error(exc)
+        if error:
+            return error
+        if fields:
+            err = _apply_metadata(path, p, fields)
+            if err:
+                return err
+            _set_file_times(path, date_str)
+        return ""
+
+    if p.gentle_compression:
+        limit = 1 if p.output_format == "png" else len(JPEG_QUALITY_STEPS)
+        return finish_compression(input_path, output_path, limit, p.keep_without_saving,
+                                  encode, cancelled, compression_callback)
+    error = "cancelled" if cancelled and cancelled() else encode(output_path, 0)
+    if error:
         _cleanup(output_path)
-        return False, f"ffmpeg failed to launch: {exc}"
-
-    if proc.returncode != 0 and is_disk_full(proc.stderr):
-        _cleanup(output_path)
-        log.error("disk full while writing %s", output_path)
-        return False, f"{DISK_FULL_ERROR} ({output_folder})"
-
-    if proc.returncode != 0:
-        _cleanup(output_path)
-        log.warning("ffmpeg failed on %s (exit %s)\ncommand: %s\nstderr:\n%s",
-                    os.path.basename(input_path), proc.returncode,
-                    subprocess.list2cmdline(cmd), proc.stderr.strip())
-        return False, f"ffmpeg exited with code {proc.returncode}: {proc.stderr.strip()[:500]}"
-
-    if p.fake_meta:
-        err = _apply_metadata(output_path, p, profile, date_str,
-                              plan.fg_w, plan.fg_h)
-        if err:
-            _cleanup(output_path)
-            return False, err
-        _set_file_times(output_path, date_str)
-
+        return False, error
     return True, ""
 
 
@@ -700,6 +718,7 @@ def process_image_batch(
     max_workers: Optional[int] = None,
     started_callback: Optional[Callable[[str], None]] = None,
     result_callback: Optional[Callable[[str, bool, str], None]] = None,
+    compression_callback: Optional[Callable[[CompressionResult], None]] = None,
 ) -> Tuple[int, List[str]]:
     """Process a batch of images concurrently.
 
@@ -771,17 +790,19 @@ def process_image_batch(
             for field_name in _STATIC_IMAGE_FIELDS:
                 setattr(params, field_name, getattr(params_template, field_name))
 
+        outcomes: List[CompressionResult] = []
         ok, err = process_single_image(
             input_path=fpath,
             output_folder=output_folder,
             index=start_index + job_id,
             params=params,
             cancelled=cancelled,
+            compression_callback=outcomes.append,
         )
 
         with state_lock:
             completed += 1
-            if ok:
+            if ok and (not outcomes or outcomes[0].output_path):
                 success_count += 1
             elif err and err != "cancelled":
                 errors.append(f"{fname}: {err}")
@@ -790,7 +811,9 @@ def process_image_batch(
             log.warning("image failed: %s: %s", fpath, err)
             if err.startswith(DISK_FULL_ERROR):
                 disk_full.set()
-        if result_callback:
+        if outcomes and compression_callback:
+            compression_callback(outcomes[0])
+        elif result_callback:
             result_callback(fpath, ok, "" if ok else (err or "failed"))
 
         if progress_callback:

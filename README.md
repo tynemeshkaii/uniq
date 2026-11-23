@@ -20,6 +20,15 @@ Standalone macOS application for video and image uniqualization, based on the HY
 - ffmpeg bundled inside the app — no external dependencies needed
 - Skeuomorphic dark UI design
 
+## Gentle compression
+
+Enable **Gentle compression** in the main window to save processed files that are smaller than their originals. The app compares the final byte counts, including metadata. Original files stay in place.
+
+- Video uses software H.264 with the medium preset. It starts at CRF 21 and tries CRF 23 only if the first file is at least as large as the input. JPEG uses the same rule with FFmpeg quality levels 3 and 4. Both attempts read the original with the same processing settings.
+- PNG uses one lossless encode of the processed pixels. Auto keeps PNG inputs and chooses PNG for inputs detected as transparent. Always JPEG flattens transparency onto white.
+- An already compact file can be skipped. Enable **Keep processed file if size cannot be reduced** to save the first, higher-quality attempt in that case. The batch summary includes any size increase in the net savings.
+- Compression temporarily overrides the manual video encoder, preset, quality and JPEG packing settings. Switch it off to resume your manual profile. Canvas, effects, audio and metadata still follow your settings.
+
 ## Quality verification
 
 The defaults are chosen so an output is indistinguishable from its source to a

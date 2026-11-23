@@ -208,11 +208,13 @@ def test_batch_statuses_and_retry(window, qapp, media, tmp_path):
 
 
 @pytest.mark.ffmpeg
-def test_quit_during_batch_stops_cleanly(window, qapp, media, tmp_path):
+@pytest.mark.parametrize("gentle", [False, True])
+def test_quit_during_batch_stops_cleanly(window, qapp, media, tmp_path, gentle):
     out = tmp_path / "out"
     out.mkdir()
     window.output_folder = str(out)
     window._add_files([media["long"]])
+    window.params_panel.chk_gentle.setChecked(gentle)
     window.params_panel.combo_preset.setCurrentText("slow")
     window.show()
     window._start_processing()
@@ -246,3 +248,48 @@ def test_worker_thread_exception_reaches_the_gui_thread(qapp):
     t.join()
     wait_for(qapp, lambda: shown, timeout=5)
     assert shown == ["boom in worker"]
+
+
+def test_gentle_controls_restore_manual_profile(window):
+    panel = window.params_panel
+    panel.combo_preset.setCurrentText("slow")
+    old = panel.get_state()
+    old.pop("chk_gentle", None)
+    old.pop("chk_keep_without_saving", None)
+    panel.chk_gentle.click()
+    panel.chk_keep_without_saving.click()
+    saved = panel.get_state()
+    assert not panel.spin_video_bitrate.isEnabled()
+    assert panel.build_image_params().keep_without_saving
+    panel.set_state(old)
+    assert not panel.chk_gentle.isChecked()
+    assert panel.combo_preset.currentText() == "slow"
+    assert panel.spin_video_bitrate.isEnabled()
+    panel.set_state(saved)
+    assert panel.build_params().gentle_compression
+    panel.load_defaults()
+    assert not panel.chk_gentle.isChecked()
+    assert not panel.chk_keep_without_saving.isEnabled()
+
+
+@pytest.mark.ffmpeg
+def test_gentle_mixed_batch_counts_skipped_and_failed(window, qapp, media, tmp_path):
+    import shutil
+    out = tmp_path / "out"
+    out.mkdir()
+    window.output_folder = str(out)
+    small = tmp_path / "icon.png"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=white:s=32x32",
+                    "-frames:v", "1", str(small)], check=True)
+    duplicate = tmp_path / "another" / small.name
+    duplicate.parent.mkdir()
+    shutil.copyfile(small, duplicate)
+    paths = [str(small), str(duplicate), media["land"], media["broken"]]
+    window._add_files(paths)
+    window.params_panel.chk_gentle.click()
+    window._start_processing()
+    wait_for(qapp, lambda: window.worker is None)
+    assert window.progress_bar.format().startswith("Done — 4/4 processed")
+    assert "Skipped without saving 2" in window.status_label.text()
+    assert window._failed_paths() == [media["broken"]]
+    assert all("Size could not be reduced" in window._items_by_path()[p].text() for p in paths[:2])

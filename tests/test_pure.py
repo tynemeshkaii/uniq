@@ -4,6 +4,7 @@ No ffmpeg and no encoding, so these run in well under a second and anywhere.
 """
 
 import os
+from pathlib import Path
 import random
 
 import pytest
@@ -213,3 +214,105 @@ def test_format_bytes(qapp):
     assert main._format_bytes(512) == "512 B"
     assert main._format_bytes(1536 * 1024) == "1.5 MB"
     assert main._format_bytes(3 * 1024 ** 3) == "3.0 GB"
+
+
+@pytest.mark.parametrize("sizes,keep,outcome,published", [
+    ([999], False, "reduced", 999),
+    ([1000, 1001], False, "skipped_without_saving", None),
+    ([1001, 1000], True, "kept_without_saving", 1001),
+    ([1001, 999], True, "reduced", 999),
+    ([0], True, None, None),
+])
+def test_candidate_selection(tmp_path, sizes, keep, outcome, published):
+    from gentle_compression import select_candidate
+    src = tmp_path / "original.jpg"
+    src.write_bytes(b"x" * 1000)
+    dest = unique_filepath(str(tmp_path), src.name, reserve=False)
+    calls = []
+    def encode(path, attempt):
+        calls.append(attempt)
+        Path(path).write_bytes(b"y" * sizes[attempt])
+        return ""
+    if outcome is None:
+        with pytest.raises(ValueError, match="empty"):
+            select_candidate(str(src), dest, 2, keep, encode, None)
+    else:
+        result = select_candidate(str(src), dest, 2, keep, encode, None)
+        assert (result.outcome, result.output_bytes) == (outcome, published)
+        assert result.attempts == len(calls)
+    assert calls == list(range(len(sizes)))
+    assert src.read_bytes() == b"x" * 1000
+    assert set(tmp_path.iterdir()) == ({src, Path(dest)} if published else {src})
+
+
+@pytest.mark.parametrize("failure", ["empty", "missing", "second", "cancel", "replace", "enospc"])
+def test_gentle_failure_preserves_input_and_cleans_candidates(tmp_path, monkeypatch, failure):
+    import errno
+    from gentle_compression import finish_compression
+    source = tmp_path / "source"
+    original = b"" if failure == "empty" else b"original"
+    if failure != "missing":
+        source.write_bytes(original)
+    reserved = tmp_path / "reserved.jpg"
+    calls = []
+
+    def encode(path, attempt):
+        calls.append(attempt)
+        if attempt == 1:
+            if failure == "second":
+                return "second encode failed"
+            if failure == "replace":
+                replacement = tmp_path / "replacement"
+                replacement.write_bytes(b"another job")
+                replacement.replace(reserved)
+            Path(path).write_bytes(b"x")
+        else:
+            Path(path).write_bytes(original)
+        return ""
+
+    if failure == "enospc":
+        def full(*args):
+            raise OSError(errno.ENOSPC, "simulated full output")
+        monkeypatch.setattr("gentle_compression._publish_exclusive", full)
+    ok, error = finish_compression(str(source), str(reserved), 2, True, encode,
+                                   lambda: failure == "cancel" and len(calls) == 2, None)
+    if failure == "replace":
+        assert ok and not error
+        assert (tmp_path / "reserved_1.jpg").read_bytes() == b"x"
+    else:
+        assert not ok and error
+    if failure not in ("empty", "missing"):
+        assert calls == [0, 1]
+    if failure == "enospc":
+        assert error == engine.DISK_FULL_ERROR
+    if failure == "replace":
+        assert reserved.read_bytes() == b"another job"
+    else:
+        assert not reserved.exists()
+    assert not list(tmp_path.glob(".gentle-*"))
+    if source.exists():
+        assert source.read_bytes() == original
+
+
+def test_concurrent_gentle_exports_leave_existing_empty_file_intact(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from gentle_compression import select_candidate
+    src = tmp_path / "input"
+    src.write_bytes(b"original")
+    dest = tmp_path / "output.jpg"
+    dest.touch()
+    barrier = Barrier(2)
+
+    def export(payload):
+        def encode(path, attempt):
+            Path(path).write_bytes(payload)
+            barrier.wait(timeout=5)
+            return ""
+        return select_candidate(str(src), str(dest), 1, False, encode, None)
+
+    with ThreadPoolExecutor(2) as pool:
+        results = list(pool.map(export, (b"a", b"b")))
+    assert dest.read_bytes() == b""
+    assert {Path(r.output_path).read_bytes() for r in results} == {b"a", b"b"}
+    assert len(list(tmp_path.iterdir())) == 4

@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, QObject, QTimer, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, QUrl, QMimeData
 from PyQt6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QIcon, QFont, QDragEnterEvent, QDropEvent
 
+from gentle_compression import CompressionResult, DISK_FULL_ERROR, JPEG_QUALITY_STEPS, VIDEO_CRF_STEPS
 from engine import (
     ENCODER_H264_VIDEOTOOLBOX,
     ENCODER_LABELS,
@@ -231,6 +232,7 @@ class ProcessWorker(QThread):
     # stills and then sits there for the whole video phase.
     overall_progress = pyqtSignal(float)
     file_started = pyqtSignal(str)             # full path
+    compression_result = pyqtSignal(object)
     file_result = pyqtSignal(str, bool, str)   # full path, ok, error
     # Deliberately not named `finished` — that would shadow QThread.finished,
     # which Qt uses internally for thread teardown.
@@ -300,11 +302,14 @@ class ProcessWorker(QThread):
                     max_workers=image_workers_for(self.workers),
                     started_callback=self.file_started.emit,
                     result_callback=self.file_result.emit,
+                    compression_callback=self.compression_result.emit,
                 )
                 count += done_images
                 errors += image_errors
 
-            if videos and not self._cancelled:
+            if videos and any(DISK_FULL_ERROR in error for error in errors):
+                errors.append(f"{len(videos)} video(s) not started: {DISK_FULL_ERROR}")
+            elif videos and not self._cancelled:
                 offset = len(images)
                 done_videos, video_errors = process_batch(
                     input_files=videos,
@@ -318,6 +323,7 @@ class ProcessWorker(QThread):
                     max_workers=self.workers,
                     started_callback=self.file_started.emit,
                     result_callback=self.file_result.emit,
+                    compression_callback=self.compression_result.emit,
                     overall_progress_callback=lambda f: self.overall_progress.emit(
                         (image_units + f * len(videos)) / all_units),
                 )
@@ -504,8 +510,26 @@ class ParamsPanel(QWidget):
             "Show every tuning control. The defaults are the measured safe "
             "operating point; Reset Defaults returns to it.")
         grid.addWidget(self.chk_advanced, 1, 2)
+        self.chk_gentle = QCheckBox("Gentle compression")
+        self.chk_keep_without_saving = QCheckBox("Keep processed file if size cannot be reduced")
+        grid.addWidget(self.chk_gentle, 2, 0, 1, 2)
+        grid.addWidget(self.chk_keep_without_saving, 3, 0, 1, 3)
+        self.gentle_profile = QLabel(
+            f"H.264 medium · CRF {VIDEO_CRF_STEPS[0]} / {VIDEO_CRF_STEPS[1]} · "
+            f"JPEG q{JPEG_QUALITY_STEPS[0]} / q{JPEG_QUALITY_STEPS[1]} · PNG lossless")
+        grid.addWidget(self.gentle_profile, 4, 0, 1, 3)
+        self.chk_gentle.toggled.connect(self._sync_gentle_controls)
         grid.setColumnStretch(1, 1)
         return grid
+
+    def _sync_gentle_controls(self):
+        enabled = self.chk_gentle.isChecked()
+        self.gentle_profile.setVisible(enabled)
+        self.chk_keep_without_saving.setEnabled(enabled)
+        for control in (self.combo_performance, self.combo_encoder, self.combo_preset,
+                        self.spin_crf, self.spin_video_bitrate, self.spin_jpeg_q_min,
+                        self.spin_jpeg_q_max, self.chk_img_huffman):
+            control.setEnabled(not enabled)
 
     def _sync_size_controls(self):
         key = self.combo_size.currentData()
@@ -917,13 +941,12 @@ class ParamsPanel(QWidget):
 
         self.combo_image_format = QComboBox()
         self.combo_image_format.addItem("Match source (JPEG in → JPEG out)", "auto")
-        self.combo_image_format.addItem("Always JPEG", "jpeg")
+        self.combo_image_format.addItem("Always JPEG (flatten transparency on white)", "jpeg")
         self.combo_image_format.addItem("Always PNG", "png")
         layout.addLayout(make_param_row(
             "Output Format:", self.combo_image_format,
             "PNG is kept lossless because flattening a graphic to JPEG rings "
-            "on every hard edge. WEBP has no encoder in the bundled ffmpeg and "
-            "always leaves as JPEG."))
+            "on every hard edge. Gentle Auto also keeps transparency in PNG."))
 
         self.spin_jpeg_q_min = QSpinBox()
         self.spin_jpeg_q_min.setRange(JPEG_QUALITY_FLOOR, JPEG_QUALITY_CEILING)
@@ -1116,6 +1139,9 @@ class ParamsPanel(QWidget):
         self._sync_size_controls()
         self.spin_width.setValue(1080)
         self.spin_height.setValue(1920)
+        self.chk_gentle.setChecked(False)
+        self.chk_keep_without_saving.setChecked(False)
+        self._sync_gentle_controls()
         self.spin_crf.setValue(24)
         self.spin_gop_min.setValue(d.gop[0])
         self.spin_gop_max.setValue(d.gop[1])
@@ -1259,6 +1285,8 @@ class ParamsPanel(QWidget):
         p.performance_profile = self.combo_performance.currentData() or PERFORMANCE_PROFILE_BALANCED
         p.encoder = self.combo_encoder.currentData() or ENCODER_LIBX264
         p.video_bitrate_kbps = self.spin_video_bitrate.value()
+        p.gentle_compression = self.chk_gentle.isChecked()
+        p.keep_without_saving = self.chk_keep_without_saving.isChecked()
         p.fake_meta = self.chk_fake_meta.isChecked()
         return p
 
@@ -1305,6 +1333,8 @@ class ParamsPanel(QWidget):
         p = ImageParams()
         p.output_format = self.combo_image_format.currentData() or "auto"
         p.max_long_side = self.spin_max_long_side.value()
+        p.gentle_compression = self.chk_gentle.isChecked()
+        p.keep_without_saving = self.chk_keep_without_saving.isChecked()
         p.fake_meta = self.chk_fake_meta.isChecked()
         return p
 
@@ -1408,6 +1438,7 @@ class MainWindow(QMainWindow):
         # Per-batch bookkeeping for the list statuses, the progress text and
         # the ETA.
         self._batch_files = []
+        self._compression_results = {}
         self._results = {}          # path -> (ok, error)
         self._active = []           # paths currently encoding, in start order
         self._done_count = 0
@@ -2188,13 +2219,18 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             log.warning("disk_usage failed for %s: %s", self.output_folder, exc)
             return True
-        total_in = 0
+        sizes = []
         for f in files:
             try:
-                total_in += os.path.getsize(f)
+                sizes.append(os.path.getsize(f))
             except OSError:
                 pass
-        needed = int(total_in * 1.5)
+        estimated_inputs = sum(sizes)
+        if self.params_panel.chk_gentle.isChecked():
+            workers = self.params_panel.worker_count()
+            concurrent = max(workers, image_workers_for(workers))
+            estimated_inputs += sum(sorted(sizes, reverse=True)[:concurrent])
+        needed = int(estimated_inputs * 1.5)
         log.info("disk check: %s free, ~%s needed", _format_bytes(free), _format_bytes(needed))
         if free < 200 * 1024 * 1024:
             QMessageBox.critical(
@@ -2241,11 +2277,14 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(self._on_progress)
         self.worker.overall_progress.connect(self._on_overall_progress)
         self.worker.file_started.connect(self._on_file_started)
+        self.worker.compression_result.connect(self._on_compression_result)
         self.worker.file_result.connect(self._on_file_result)
         self.worker.job_finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
 
+        self._gentle_batch = self.worker.params.gentle_compression
         self._batch_files = files
+        self._compression_results = {}
         self._results = {}
         self._active = []
         self._done_count = 0
@@ -2295,6 +2334,7 @@ class MainWindow(QMainWindow):
 
     def _on_overall_progress(self, fraction: float):
         total = len(self._batch_files)
+        fraction = max(fraction, self.progress_bar.value() / 1000)
         self.progress_bar.setValue(int(fraction * 1000))
         text = f"{self._done_count}/{total} done · {int(fraction * 100)}%"
         eta = self._eta_text(fraction)
@@ -2319,6 +2359,25 @@ class MainWindow(QMainWindow):
     def _on_file_started(self, path: str):
         self._active.append(path)
         self._set_status(self._items_by_path().get(path), "running")
+        self._show_active()
+
+    def _on_compression_result(self, result: CompressionResult):
+        path = result.input_path
+        self._compression_results[path] = result
+        if path in self._active:
+            self._active.remove(path)
+        self._results[path] = (True, "")
+        item = self._items_by_path().get(path)
+        if result.output_bytes is None:
+            status = "skipped"
+            detail = f"{result.input_bytes:,} B · Size could not be reduced"
+        else:
+            status = "ok"
+            saving = (1 - result.output_bytes / result.input_bytes) * 100
+            detail = f"{result.input_bytes:,} → {result.output_bytes:,} B ({saving:+.1f}% saved)"
+        self._set_status(item, status, detail)
+        if item:
+            item.setText(f"{item.text()} · {detail}")
         self._show_active()
 
     def _on_file_result(self, path: str, ok: bool, error: str):
@@ -2362,21 +2421,33 @@ class MainWindow(QMainWindow):
             return
 
         failed = sum(1 for ok, err in self._results.values() if not ok and err != "cancelled")
+        processed = success_count
+        if self._gentle_batch:
+            processed = len(self._compression_results) + failed
         elapsed = time.monotonic() - self._batch_started
         took = f"{elapsed:.0f} s" if elapsed < 90 else f"{elapsed / 60:.1f} min"
         if was_cancelled:
-            self.progress_bar.setValue(int(success_count / total * 1000) if total else 0)
-            self.progress_bar.setFormat(f"Cancelled — {success_count}/{total} processed")
+            self.progress_bar.setValue(int(processed / total * 1000) if total else 0)
+            self.progress_bar.setFormat(f"Cancelled — {processed}/{total} processed")
             self.status_label.setText("")
             return
 
         self.progress_bar.setValue(1000)
-        self.progress_bar.setFormat(f"Done — {success_count}/{total} processed in {took}")
+        self.progress_bar.setFormat(f"Done — {processed}/{total} processed in {took}")
         self.status_label.setText(
             f"{failed} file(s) failed — hover a ✗ row for the reason, or use Retry Failed."
             if failed else "")
 
-        msg = f"Processed {success_count} of {total} files in {took}."
+        msg = f"Processed {processed} of {total} files in {took}."
+        if self._gentle_batch:
+            results = list(self._compression_results.values())
+            saved = sum(r.input_bytes - r.output_bytes for r in results if r.output_bytes is not None)
+            counts = [sum(r.outcome == kind for r in results) for kind in
+                      ("reduced", "kept_without_saving", "skipped_without_saving")]
+            summary = (f"Reduced {counts[0]} · Kept without saving {counts[1]} · "
+                       f"Skipped without saving {counts[2]} · Failed {failed} · Net saved {saved:,} B")
+            self.status_label.setText(summary)
+            msg += "\n\n" + summary
         if errors:
             msg += f"\n\nErrors ({len(errors)}):\n" + "\n".join(errors[:10])
             if len(errors) > 10:

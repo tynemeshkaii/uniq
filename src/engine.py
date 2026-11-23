@@ -29,7 +29,8 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from gentle_compression import VIDEO_CRF_STEPS, CompressionResult, DISK_FULL_ERROR, file_error, finish_compression
 from typing import Optional, List, Callable, Tuple
 
 log = logging.getLogger(__name__)
@@ -159,12 +160,23 @@ _FFMPEG_STALL_TIMEOUT = 180
 # Prefix of the error a job returns when the output volume filled up. The batch
 # stops scheduling new files on it: every one of them would fail the same way,
 # each after writing a partial file first.
-DISK_FULL_ERROR = "output disk is full"
+
 _DISK_FULL_MARKERS = ("No space left on device", "ENOSPC")
 
 
 def is_disk_full(stderr_text: str) -> bool:
-    return any(m in stderr_text for m in _DISK_FULL_MARKERS)
+    # A filter graph can return AVERROR(ENOSPC) when it runs out of frames.
+    # Only output I/O diagnostics (or a bare OS message) stop the batch.
+    for line in stderr_text.splitlines():
+        if not any(marker in line for marker in _DISK_FULL_MARKERS):
+            continue
+        if (line.strip() in _DISK_FULL_MARKERS
+                or line.lstrip().startswith("[out#")
+                or any(word in line.lower() for word in
+                       ("av_interleaved_write_frame", "writing trailer", "closing file",
+                        "opening output", "writing header", "muxing a packet"))):
+            return True
+    return False
 ENCODER_LIBX264 = "libx264"
 ENCODER_H264_VIDEOTOOLBOX = "h264_videotoolbox"
 ENCODER_HEVC_VIDEOTOOLBOX = "hevc_videotoolbox"
@@ -456,7 +468,7 @@ _filepath_lock = threading.Lock()
 
 def unique_filepath(folder: str, filename: str,
                     regenerate: Optional[Callable[[], str]] = None,
-                    attempts: int = 64) -> str:
+                    attempts: int = 64, *, reserve: bool = True) -> str:
     """Reserve a free path. Creates the file so concurrent workers cannot collide.
 
     ``regenerate`` returns a fresh candidate *name*; when given, a collision
@@ -472,12 +484,12 @@ def unique_filepath(folder: str, filename: str,
             candidate = os.path.join(folder, candidate_name)
             if not os.path.exists(candidate):
                 try:
-                    open(candidate, "xb").close()
+                    if reserve:
+                        open(candidate, "xb").close()
                     return candidate
                 except FileExistsError:
                     pass
-                except OSError:
-                    return candidate
+
             if regenerate is None:
                 break
             candidate_name = regenerate()
@@ -488,17 +500,16 @@ def unique_filepath(folder: str, filename: str,
             candidate = os.path.join(folder, f"{name}_{i}{ext}")
             if not os.path.exists(candidate):
                 try:
-                    open(candidate, "xb").close()
+                    if reserve:
+                        open(candidate, "xb").close()
                 except FileExistsError:
                     continue
-                except OSError:
-                    pass
                 return candidate
-    return candidate
+    raise FileExistsError("all output names are reserved")
 
 
 def reserve_natural_filepath(folder: str, profile: dict, date_str: str,
-                             kind: str = "video", ext: str = "") -> Tuple[str, str]:
+                             kind: str = "video", ext: str = "", *, reserve: bool = True) -> Tuple[str, str]:
     """Reserve an output path under a name the chosen device could have written.
 
     Returns ``(path, date_str)``. The date comes back because a collision
@@ -515,7 +526,7 @@ def reserve_natural_filepath(folder: str, profile: dict, date_str: str,
         state["date"] = UniqueParams.random_date_str()
         return _draw()
 
-    path = unique_filepath(folder, _draw(), regenerate=_redraw)
+    path = unique_filepath(folder, _draw(), regenerate=_redraw, reserve=reserve)
     return path, state["date"]
 
 
@@ -861,6 +872,9 @@ class UniqueParams:
     # Meta
     fake_meta: bool = True
 
+    gentle_compression: bool = False
+    keep_without_saving: bool = False
+
     @staticmethod
     def random_date_str() -> str:
         """A plausible capture timestamp within the last two years.
@@ -1014,6 +1028,7 @@ class UniqueParams:
 # Output/container settings. These describe the deliverable rather than the
 # uniqualization, so they are copied from the template instead of randomized.
 _STATIC_FIELDS = [
+    "gentle_compression", "keep_without_saving",
     "overlay_file", "target_width", "target_height", "crf", "preset",
     "encoder", "performance_profile", "video_bitrate_kbps", "fake_meta", "threads",
 ]
@@ -1694,6 +1709,7 @@ def process_single_video(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     file_progress_callback: Optional[Callable[[float], None]] = None,
     cancelled: Optional[Callable[[], bool]] = None,
+    compression_callback: Optional[Callable[[CompressionResult], None]] = None,
 ) -> Tuple[bool, str]:
     """
     Process a single video file.
@@ -1702,7 +1718,7 @@ def process_single_video(
     if params is None:
         params = UniqueParams.generate_random()
 
-    p = params
+    p = replace(params)
     overlay_path = p.overlay_file if p.overlay_file else ""
     has_overlay = bool(overlay_path) and os.path.isfile(overlay_path)
 
@@ -1714,18 +1730,14 @@ def process_single_video(
         p.target_width, p.target_height = match_source_size(info.width, info.height)
 
     duration = info.duration
-    if duration and (p.trim_start + p.trim_end) >= duration * 0.4:
+    if duration and duration <= 1.0:
+        p.trim_start = p.trim_end = 0.0
+    elif duration and (p.trim_start + p.trim_end) >= duration * 0.4:
         p.trim_start = 0.1
         p.trim_end = 0.1
 
     profile = random.choice(DEVICE_PROFILES)
     date_str = UniqueParams.random_date_str()
-
-    if p.fake_meta:
-        output_path, date_str = reserve_natural_filepath(
-            output_folder, profile, date_str)
-    else:
-        output_path = unique_filepath(output_folder, f"uniq_{index}.mp4")
 
     trim_args = ["-ss", str(p.trim_start)]
     effective_duration = None
@@ -1834,7 +1846,7 @@ def process_single_video(
         if p.fake_meta:
             cmd += ["-brand", profile.get("brand", "mp42")]
             cmd += ["-video_track_timescale", str(profile.get("timescale", 600))]
-            cmd += build_metadata_args(profile, date_str)
+            cmd += metadata_args
 
         cmd += [
             "-movflags", "+faststart+use_metadata_tags",
@@ -1923,7 +1935,10 @@ def process_single_video(
                     last_time = secs
                     last_advance[0] = time.monotonic()
                     if effective_duration and file_progress_callback:
-                        file_progress_callback(min(secs / effective_duration, 1.0))
+                        fraction = min(secs / effective_duration, 1.0)
+                        if p.gentle_compression:
+                            fraction = (attempt_index + fraction * 0.99) / 2
+                        file_progress_callback(fraction)
             # stdout closes as ffmpeg exits; the watchdog still covers a
             # process that closes it and then fails to exit.
             proc.wait()
@@ -1960,6 +1975,37 @@ def process_single_video(
             return "failed", (f"ffmpeg exited with code {proc.returncode}: "
                               f"{stderr_out[:500]}")
         return "ok", ""
+
+    try:
+        if p.fake_meta:
+            output_path, date_str = reserve_natural_filepath(
+                output_folder, profile, date_str, reserve=not p.gentle_compression)
+        else:
+            output_path = unique_filepath(output_folder, f"uniq_{index}.mp4", reserve=not p.gentle_compression)
+    except OSError as exc:
+        return False, file_error(exc)
+
+    metadata_args = build_metadata_args(profile, date_str) if p.fake_meta else []
+    attempt_index = 0
+    if p.gentle_compression:
+        p.preset = "medium"
+
+        def encode(path, attempt):
+            nonlocal attempt_index
+            attempt_index = attempt
+            p.crf = VIDEO_CRF_STEPS[attempt]
+            cmd = _build_cmd(ENCODER_LIBX264)
+            cmd[-1] = path
+            status, detail = _run(cmd)
+            if status == "ok" and p.fake_meta:
+                _set_file_times(path, date_str)
+            return detail
+
+        result = finish_compression(input_path, output_path, len(VIDEO_CRF_STEPS), p.keep_without_saving,
+                                    encode, cancelled, compression_callback)
+        if result[0] and file_progress_callback:
+            file_progress_callback(1.0)
+        return result
 
     if cancelled and cancelled():
         _cleanup_output(output_path)
@@ -2026,6 +2072,7 @@ def process_batch(
     started_callback: Optional[Callable[[str], None]] = None,
     result_callback: Optional[Callable[[str, bool, str], None]] = None,
     overall_progress_callback: Optional[Callable[[float], None]] = None,
+    compression_callback: Optional[Callable[[CompressionResult], None]] = None,
 ) -> Tuple[int, List[str]]:
     """
     Process a batch of video files, several at a time.
@@ -2078,10 +2125,12 @@ def process_batch(
         if overall_progress_callback:
             overall_progress_callback(min(overall, 1.0))
 
-    def _report_done(fpath: str, ok: bool, err: str):
+    def _report_done(fpath: str, ok: bool, err: str, outcome=None):
         with state_lock:
             overall = (completed + sum(active_progress.values())) / total
-        if result_callback:
+        if outcome and compression_callback:
+            compression_callback(outcome)
+        elif result_callback:
             result_callback(fpath, ok, err)
         if overall_progress_callback:
             overall_progress_callback(min(overall, 1.0))
@@ -2135,6 +2184,7 @@ def process_batch(
 
         params.threads = per_job_threads
 
+        outcomes: List[CompressionResult] = []
         ok, err = process_single_video(
             input_path=fpath,
             output_folder=output_folder,
@@ -2142,12 +2192,13 @@ def process_batch(
             params=params,
             file_progress_callback=lambda pct, jid=job_id: _report_file_progress(jid, pct),
             cancelled=cancelled,
+            compression_callback=outcomes.append,
         )
 
         with state_lock:
             completed += 1
             active_progress.pop(job_id, None)
-            if ok:
+            if ok and (not outcomes or outcomes[0].output_path):
                 success_count += 1
             elif err and err != "cancelled":
                 errors.append(f"{fname}: {err}")
@@ -2156,7 +2207,7 @@ def process_batch(
             log.warning("video failed: %s: %s", fpath, err)
             if err.startswith(DISK_FULL_ERROR):
                 disk_full.set()
-        _report_done(fpath, ok, "" if ok else (err or "failed"))
+        _report_done(fpath, ok, "" if ok else (err or "failed"), outcomes[0] if outcomes else None)
 
         if progress_callback:
             progress_callback(done, total, fname)
